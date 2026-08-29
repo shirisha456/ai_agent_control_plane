@@ -1,0 +1,45 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: acp
+      POSTGRES_PASSWORD: acp
+      POSTGRES_DB: acp
+    ports: ["${ACP_PG_PORT:-5434}:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U acp -d acp"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    command:
+      # The claim/complete cycle churns the same rows constantly, so `tasks`
+      # produces dead tuples far faster than the stock autovacuum thresholds
+      # expect. Left at defaults, the ready-queue index bloats and claim
+      # latency degrades over a long benchmark run. See docs/ARCHITECTURE.md.
+      - "postgres"
+      - "-c"
+      - "autovacuum_vacuum_scale_factor=0.02"
+      - "-c"
+      - "autovacuum_naptime=10s"
+      - "-c"
+      - "max_connections=200"
+
+  migrate:
+    build: .
+    depends_on:
+      postgres: {condition: service_healthy}
+    environment:
+      ACP_DATABASE_URL: postgresql+psycopg://acp:acp@postgres:5432/acp
+    command: ["alembic", "upgrade", "head"]
+
+  api:
+    build: .
+    depends_on:
+      postgres: {condition: service_healthy}
+      migrate: {condition: service_completed_successfully}
+    environment:
+      ACP_DATABASE_URL: postgresql+psycopg://acp:acp@postgres:5432/acp
+    ports: ["${ACP_API_PORT:-8001}:8000"]
+    command: ["uvicorn", "acp.api.app:app", "--host", "0.0.0.0", "--port", "8000"]
+
+  # worker / reaper services arrive in Phase 2 and Phase 3.
