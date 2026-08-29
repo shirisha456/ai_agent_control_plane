@@ -4,7 +4,8 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from acp.api.routes import health
+from acp.api.errors import install_error_handlers
+from acp.api.routes import health, tasks, tenants
 from acp.config import settings
 from acp.db.session import dispose_engine
 from acp.obs.logging import configure_logging, get_logger
@@ -34,7 +35,10 @@ app = FastAPI(
     summary="Distributed scheduling and durable execution for AI agent workloads",
     lifespan=lifespan,
 )
+install_error_handlers(app)
 app.include_router(health.router)
+app.include_router(tenants.router)
+app.include_router(tasks.router)
 
 
 @app.get("/", tags=["health"])

@@ -29,6 +29,11 @@ def engine() -> AsyncEngine:
             pool_size=s.db_pool_size,
             max_overflow=s.db_max_overflow,
             pool_pre_ping=True,
+            # libpq-level bound on establishing a TCP connection. Without
+            # it, a database that is unreachable rather than refusing
+            # connections blocks until the OS gives up -- around two
+            # minutes on Windows.
+            connect_args={"connect_timeout": s.db_connect_timeout_s},
             future=True,
         )
     return _engine

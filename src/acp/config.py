@@ -17,6 +17,10 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg://acp:acp@localhost:5434/acp"
     db_pool_size: int = 10
     db_max_overflow: int = 10
+    # Every outbound wait in this system is bounded. An unbounded connect
+    # turns a slow database into a hung process that reports nothing.
+    db_connect_timeout_s: int = 5
+    health_probe_timeout_s: float = 2.0
 
     log_level: str = "INFO"
     log_format: str = "json"  # "json" | "console"

@@ -146,7 +146,10 @@ async def _explain(
         (
             await conn.execute(
                 sa.select(
-                    tasks.c.state, tasks.c.attempt, tasks.c.lease_worker_id, tasks.c.lease_expires_at
+                    tasks.c.state,
+                    tasks.c.attempt,
+                    tasks.c.lease_worker_id,
+                    tasks.c.lease_expires_at,
                 ).where(tasks.c.id == task_id)
             )
         )

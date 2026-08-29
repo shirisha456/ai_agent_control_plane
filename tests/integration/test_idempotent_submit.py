@@ -49,9 +49,7 @@ async def test_concurrent_duplicate_submits_create_one_task(engine, tenant_id) -
     async with engine.connect() as conn:
         count = (
             await conn.execute(
-                sa.select(sa.func.count())
-                .select_from(tasks)
-                .where(tasks.c.idempotency_key == key)
+                sa.select(sa.func.count()).select_from(tasks).where(tasks.c.idempotency_key == key)
             )
         ).scalar_one()
     assert count == 1

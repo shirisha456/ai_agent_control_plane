@@ -35,7 +35,15 @@ async def test_healthz_reports_database_reachability(migrated_db, monkeypatch) -
 
 
 async def test_healthz_reports_503_when_database_is_gone(monkeypatch) -> None:
-    """The failure path is the one that matters, so it gets its own test."""
+    """The failure path is the one that matters, so it gets its own test.
+
+    It also pins the timeout budget. Before /healthz was bounded, this test
+    took 130 seconds -- which is exactly how long a real load balancer would
+    have waited on a probe before learning anything.
+    """
+    import time
+
+    started = time.monotonic()
     monkeypatch.setenv(
         "ACP_DATABASE_URL", "postgresql+psycopg://acp:acp@127.0.0.1:1/definitely_not_here"
     )
@@ -47,7 +55,11 @@ async def test_healthz_reports_503_when_database_is_gone(monkeypatch) -> None:
             resp = await client.get("/healthz")
 
         assert resp.status_code == 503
-        assert resp.json()["database"] == "unreachable"
+        assert resp.json()["database"] in ("unreachable", "timeout")
+        assert time.monotonic() - started < 10, (
+            "the probe must fail within its budget; an unbounded health check "
+            "makes a slow database indistinguishable from a dead one"
+        )
     finally:
         await dispose_engine()
         settings.cache_clear()

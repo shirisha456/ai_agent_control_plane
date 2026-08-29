@@ -30,14 +30,18 @@ def upgrade() -> None:
     # is a feature: adding a state should require a migration and a moment's
     # thought, not a string literal.
     op.execute(
-        "CREATE TYPE task_state AS ENUM "
-        "('QUEUED', 'RUNNING', 'SUCCEEDED', 'FAILED', 'CANCELLED')"
+        "CREATE TYPE task_state AS ENUM ('QUEUED', 'RUNNING', 'SUCCEEDED', 'FAILED', 'CANCELLED')"
     )
     task_state = pg.ENUM(name="task_state", create_type=False)
 
     op.create_table(
         "tenants",
-        sa.Column("id", pg.UUID(as_uuid=True), primary_key=True, server_default=sa.text("gen_random_uuid()")),
+        sa.Column(
+            "id",
+            pg.UUID(as_uuid=True),
+            primary_key=True,
+            server_default=sa.text("gen_random_uuid()"),
+        ),
         sa.Column("name", sa.Text, nullable=False, unique=True),
         sa.Column("max_concurrent_tasks", sa.Integer, nullable=False, server_default="10"),
         sa.Column("max_queued_tasks", sa.Integer, nullable=False, server_default="1000"),
@@ -47,8 +51,18 @@ def upgrade() -> None:
 
     op.create_table(
         "tasks",
-        sa.Column("id", pg.UUID(as_uuid=True), primary_key=True, server_default=sa.text("gen_random_uuid()")),
-        sa.Column("tenant_id", pg.UUID(as_uuid=True), sa.ForeignKey("tenants.id", ondelete="RESTRICT"), nullable=False),
+        sa.Column(
+            "id",
+            pg.UUID(as_uuid=True),
+            primary_key=True,
+            server_default=sa.text("gen_random_uuid()"),
+        ),
+        sa.Column(
+            "tenant_id",
+            pg.UUID(as_uuid=True),
+            sa.ForeignKey("tenants.id", ondelete="RESTRICT"),
+            nullable=False,
+        ),
         sa.Column("task_type", sa.Text, nullable=False),
         sa.Column("payload", pg.JSONB, nullable=False, server_default=sa.text("'{}'::jsonb")),
         sa.Column("idempotency_key", sa.Text),
@@ -92,7 +106,12 @@ def upgrade() -> None:
     op.create_table(
         "task_events",
         sa.Column("id", sa.BigInteger, primary_key=True, autoincrement=True),
-        sa.Column("task_id", pg.UUID(as_uuid=True), sa.ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False),
+        sa.Column(
+            "task_id",
+            pg.UUID(as_uuid=True),
+            sa.ForeignKey("tasks.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
         sa.Column("attempt", sa.Integer),
         sa.Column("event_type", sa.Text, nullable=False),
         sa.Column("worker_id", sa.Text),
