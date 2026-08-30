@@ -42,4 +42,20 @@ services:
     ports: ["${ACP_API_PORT:-8001}:8000"]
     command: ["uvicorn", "acp.api.app:app", "--host", "0.0.0.0", "--port", "8000"]
 
-  # worker / reaper services arrive in Phase 2 and Phase 3.
+  worker:
+    build: .
+    depends_on:
+      postgres: {condition: service_healthy}
+      migrate: {condition: service_completed_successfully}
+    environment:
+      ACP_DATABASE_URL: postgresql+psycopg://acp:acp@postgres:5432/acp
+    command: ["python", "-m", "acp.worker"]
+
+  reaper:
+    build: .
+    depends_on:
+      postgres: {condition: service_healthy}
+      migrate: {condition: service_completed_successfully}
+    environment:
+      ACP_DATABASE_URL: postgresql+psycopg://acp:acp@postgres:5432/acp
+    command: ["python", "-m", "acp.reaper"]

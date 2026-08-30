@@ -5,6 +5,9 @@ fenced on attempt + worker_id so a worker that lost its lease mid-run cannot
 overwrite whoever reclaimed it) with the matching update to that attempt's
 task_attempts row. Both happen in the caller's transaction, so a completed
 attempt and its outcome can never disagree.
+
+`finish_attempt` is also used by acp.db.queries.reap -- a reaper recovery is
+a fifth way an attempt ends, just not one a worker chose.
 """
 
 from __future__ import annotations
@@ -21,7 +24,7 @@ from acp.db.queries.transitions import TransitionResult, transition
 from acp.domain.states import EventType, State
 
 
-async def _finish_attempt(
+async def finish_attempt(
     conn: AsyncConnection,
     task_id: UUID,
     attempt: int,
@@ -66,7 +69,7 @@ async def complete_success(
         },
     )
     if res.applied:
-        await _finish_attempt(conn, task_id, attempt, outcome="SUCCEEDED")
+        await finish_attempt(conn, task_id, attempt, outcome="SUCCEEDED")
     return res
 
 
@@ -98,7 +101,7 @@ async def complete_retry(
         event_data={"error_class": error_class},
     )
     if res.applied:
-        await _finish_attempt(
+        await finish_attempt(
             conn, task_id, attempt, outcome="FAILED", error_class=error_class, error_message=error_message
         )
     return res
@@ -130,7 +133,7 @@ async def complete_failed(
         },
     )
     if res.applied:
-        await _finish_attempt(
+        await finish_attempt(
             conn, task_id, attempt, outcome="FAILED", error_class=error_class, error_message=error_message
         )
     return res
@@ -158,5 +161,5 @@ async def complete_cancelled(
         },
     )
     if res.applied:
-        await _finish_attempt(conn, task_id, attempt, outcome="CANCELLED")
+        await finish_attempt(conn, task_id, attempt, outcome="CANCELLED")
     return res

@@ -14,18 +14,30 @@ locked id set, so the SELECT and the UPDATE that grants the lease happen in
 one statement -- there is no window between "we picked this row" and "we own
 this row" for another connection to slip into.
 
-Tenant concurrency (tenants.max_concurrent_tasks) is enforced in two steps.
-The SELECT ... FOR UPDATE SKIP LOCKED first locks a policy-ordered batch of
-QUEUED candidates -- cheaply over-fetching, since locking a row we end up not
-claiming just makes another worker's SELECT skip past it for the (short)
-lifetime of this transaction. Then, still inside the same transaction, each
-tenant's remaining slack (max_concurrent_tasks - currently RUNNING) is read
-once and applied in Python, keeping only the policy-ordered prefix each
-tenant has room for. A single-statement correlated subquery cannot do this
-correctly: every candidate in one batch would see the SAME pre-batch RUNNING
-count, so a tenant at 0/1 with two eligible tasks in the batch would have
-BOTH pass the check. Slack has to be consumed as it is spent, not read once
-per row.
+Tenant concurrency (tenants.max_concurrent_tasks) is enforced in two steps,
+run in ROUNDS rather than one big over-fetch. Each round locks (SELECT ...
+FOR UPDATE SKIP LOCKED) only as many candidates as are still needed to reach
+`limit`, then reads each newly-seen tenant's remaining slack
+(max_concurrent_tasks - currently RUNNING, itself locked -- see below) and
+keeps the policy-ordered prefix that tenant has room for. A candidate
+dropped for lack of slack stays locked for the rest of this transaction (Postgres has no
+partial-release of a row lock before COMMIT) but is excluded from the next
+round's SELECT, so a fresh round can still make progress instead of
+re-examining it. Rounds are bounded (MAX_ROUNDS) so a long run of
+at-their-cap tenants costs a few extra round-trips, not an unbounded scan.
+
+Locking only what is needed per round, instead of locking a large fixed
+over-fetch up front, matters most exactly when it looks like it wouldn't:
+under a SHALLOW queue. A worker whose SELECT locks (say) 50 candidates
+because the multiplier said so, but only claims 3, holds the other 47 locked
+for its whole transaction -- if the queue only has 8 rows total, that is not
+"a few wasted locks", it is the entire queue, and every other concurrently
+claiming worker sees zero available candidates until the first worker
+commits. A single-statement correlated subquery cannot compute slack
+correctly either way: every candidate in one batch would see the SAME
+pre-batch RUNNING count, so a tenant at 0/1 with two eligible tasks in the
+batch would have BOTH pass the check. Slack has to be consumed as it is
+spent, not read once per row.
 """
 
 from __future__ import annotations
@@ -40,6 +52,11 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from acp.db.models import task_attempts, task_events, tasks, tenants
 from acp.domain.states import EventType, State
 from acp.scheduling.policy import ClaimPolicy
+
+#: How many consecutive tenant-blocked rounds one claim call absorbs before
+#: giving up and leaving the rest for the next poll cycle. Not a correctness
+#: requirement -- worst case it just costs another poll cycle.
+MAX_ROUNDS = 4
 
 
 async def claim_tasks(
@@ -57,56 +74,63 @@ async def claim_tasks(
     """
     order_sql = policy.order_by_sql()
 
-    # Over-fetch: rows locked here but dropped for lacking tenant slack (below)
-    # do not count toward `limit`, so fetching exactly `limit` would let a run
-    # of at-their-cap tenants at the front of the sort order starve every
-    # tenant behind them every single round. The multiplier is a bound on how
-    # many consecutive blocked candidates one claim can absorb, not a
-    # correctness requirement -- worst case it just costs another poll cycle.
-    over_fetch = max(limit * 4, 50)
-    locked = (
-        sa.select(tasks.c.id, tasks.c.tenant_id)
-        .where(tasks.c.state == State.QUEUED.value, tasks.c.available_at <= sa.func.now())
-        .order_by(sa.text(order_sql))
-        .limit(over_fetch)
-        .with_for_update(skip_locked=True)
-    )
-    candidates = (await conn.execute(locked)).all()
-    if not candidates:
-        return []
-
-    # FOR UPDATE on the tenant rows themselves: without it, two concurrent
-    # claim_tasks transactions each read the RUNNING count before either
-    # commits its UPDATE, both see the same slack, and both claim -- letting
-    # a tenant exceed max_concurrent_tasks. Locking the tenant row makes the
-    # second transaction's SELECT block until the first commits (releasing
-    # the lock) and its own RUNNING count reflects that first claim.
-    tenant_ids = {row.tenant_id for row in candidates}
-    slack_rows = (
-        await conn.execute(
-            sa.select(
-                tenants.c.id,
-                tenants.c.max_concurrent_tasks
-                - sa.select(sa.func.count())
-                .select_from(tasks)
-                .where(tasks.c.tenant_id == tenants.c.id, tasks.c.state == State.RUNNING.value)
-                .scalar_subquery(),
-            )
-            .where(tenants.c.id.in_(tenant_ids))
-            .with_for_update()
-        )
-    ).all()
-    slack: dict[UUID, int] = {row[0]: row[1] for row in slack_rows}
-
     claimed_ids: list[UUID] = []
-    for row in candidates:
-        if len(claimed_ids) >= limit:
+    seen_ids: set[UUID] = set()
+    slack: dict[UUID, int] = {}
+    slack_known: set[UUID] = set()
+
+    for _ in range(MAX_ROUNDS):
+        need = limit - len(claimed_ids)
+        if need <= 0:
             break
-        remaining = slack.get(row.tenant_id, 0)
-        if remaining <= 0:
-            continue
-        slack[row.tenant_id] = remaining - 1
-        claimed_ids.append(row.id)
+
+        stmt = sa.select(tasks.c.id, tasks.c.tenant_id).where(
+            tasks.c.state == State.QUEUED.value, tasks.c.available_at <= sa.func.now()
+        )
+        if seen_ids:
+            stmt = stmt.where(tasks.c.id.notin_(seen_ids))
+        stmt = stmt.order_by(sa.text(order_sql)).limit(need).with_for_update(skip_locked=True)
+        batch = (await conn.execute(stmt)).all()
+        if not batch:
+            break
+        seen_ids.update(row.id for row in batch)
+
+        # FOR UPDATE on the tenant rows themselves: without it, two concurrent
+        # claim_tasks transactions each read the RUNNING count before either
+        # commits its UPDATE, both see the same slack, and both claim --
+        # letting a tenant exceed max_concurrent_tasks. Locking the tenant row
+        # makes the second transaction's SELECT block until the first commits
+        # (releasing the lock) and its own RUNNING count reflects that claim.
+        new_tenant_ids = {row.tenant_id for row in batch} - slack_known
+        if new_tenant_ids:
+            slack_rows = (
+                await conn.execute(
+                    sa.select(
+                        tenants.c.id,
+                        tenants.c.max_concurrent_tasks
+                        - sa.select(sa.func.count())
+                        .select_from(tasks)
+                        .where(
+                            tasks.c.tenant_id == tenants.c.id, tasks.c.state == State.RUNNING.value
+                        )
+                        .scalar_subquery(),
+                    )
+                    .where(tenants.c.id.in_(new_tenant_ids))
+                    .with_for_update()
+                )
+            ).all()
+            slack.update({row[0]: row[1] for row in slack_rows})
+            slack_known.update(new_tenant_ids)
+
+        for row in batch:
+            if len(claimed_ids) >= limit:
+                break
+            remaining = slack.get(row.tenant_id, 0)
+            if remaining <= 0:
+                continue
+            slack[row.tenant_id] = remaining - 1
+            claimed_ids.append(row.id)
+
     if not claimed_ids:
         return []
 

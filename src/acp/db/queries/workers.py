@@ -1,8 +1,7 @@
-"""Worker registry: identity and heartbeat, nothing else.
+"""Worker registry: identity, heartbeat, and (Phase 3) liveness.
 
-Phase 2 deliberately has no failure detection (see migration 0003's docstring)
--- last_heartbeat_at is recorded here so Phase 3's reaper has real data to
-read, but nothing yet acts on staleness.
+last_heartbeat_at has been recorded since Phase 2; mark_dead_workers is the
+first thing that acts on staleness.
 """
 
 from __future__ import annotations
@@ -53,7 +52,28 @@ async def register_worker(
 
 async def heartbeat(conn: AsyncConnection, *, worker_id: str) -> None:
     await conn.execute(
-        sa.update(workers)
-        .where(workers.c.id == worker_id)
-        .values(last_heartbeat_at=sa.func.now())
+        sa.update(workers).where(workers.c.id == worker_id).values(last_heartbeat_at=sa.func.now())
     )
+
+
+async def mark_dead_workers(conn: AsyncConnection, *, dead_after_s: int) -> Sequence[str]:
+    """Flip ALIVE/DRAINING workers whose heartbeat has gone stale to DEAD.
+
+    Not a CAS in the tasks-state-machine sense -- workers have no fencing
+    token to protect, `status` is purely informational (task ownership is
+    fenced by lease_worker_id + attempt, not by this column). A worker that
+    somehow heartbeats again after being marked DEAD stays DEAD; a restarted
+    process gets a fresh, generation-unique id instead of resurrecting this
+    one (see migration 0003).
+    """
+    stmt = (
+        sa.update(workers)
+        .where(
+            workers.c.status != "DEAD",
+            workers.c.last_heartbeat_at
+            < sa.func.now() - sa.text(f"interval '{dead_after_s} seconds'"),
+        )
+        .values(status="DEAD")
+        .returning(workers.c.id)
+    )
+    return (await conn.execute(stmt)).scalars().all()

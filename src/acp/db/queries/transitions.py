@@ -55,6 +55,7 @@ class Rejection(StrEnum):
     STATE_MISMATCH = "state_mismatch"
     ATTEMPT_MISMATCH = "attempt_mismatch"
     WORKER_MISMATCH = "worker_mismatch"
+    LEASE_NOT_EXPIRED = "lease_not_expired"
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +78,7 @@ async def transition(
     event_type: EventType,
     expect_attempt: int | None = None,
     expect_worker: str | None = None,
+    expect_lease_expired: bool = False,
     set_fields: Mapping[str, Any] | None = None,
     event_data: Mapping[str, Any] | None = None,
 ) -> TransitionResult:
@@ -90,6 +92,15 @@ async def transition(
     scoped to lease ownership (renew, complete, fail, checkpoint). A worker
     that lost its lease while paused will present a stale attempt number, the
     predicate will match zero rows, and its result is discarded.
+
+    `expect_lease_expired=True` is the reaper's fence: it does not know (or
+    care) who currently holds the lease, only that `lease_expires_at` is in
+    the past. Comparing against `now()` in the UPDATE's WHERE clause -- not a
+    value read earlier in Python -- means EvalPlanQual re-checks it against
+    whatever the row's latest committed version says: if the real owner
+    renews between the reaper's candidate SELECT and this UPDATE, the
+    predicate now fails and the reaper's write is discarded, exactly like any
+    other lost CAS race.
     """
     expected: tuple[State, ...] = (
         (expect_state,) if isinstance(expect_state, State) else tuple(expect_state)
@@ -111,11 +122,15 @@ async def transition(
         stmt = stmt.where(tasks.c.attempt == expect_attempt)
     if expect_worker is not None:
         stmt = stmt.where(tasks.c.lease_worker_id == expect_worker)
+    if expect_lease_expired:
+        stmt = stmt.where(tasks.c.lease_expires_at < sa.func.now())
 
     row = (await conn.execute(stmt.values(**values).returning(*tasks.c))).mappings().first()
 
     if row is None:
-        return await _explain(conn, task_id, expected, expect_attempt, expect_worker)
+        return await _explain(
+            conn, task_id, expected, expect_attempt, expect_worker, expect_lease_expired
+        )
 
     await conn.execute(
         sa.insert(task_events).values(
@@ -135,6 +150,7 @@ async def _explain(
     expected: tuple[State, ...],
     expect_attempt: int | None,
     expect_worker: str | None,
+    expect_lease_expired: bool,
 ) -> TransitionResult:
     """Re-read the row to classify the rejection.
 
@@ -150,6 +166,7 @@ async def _explain(
                     tasks.c.attempt,
                     tasks.c.lease_worker_id,
                     tasks.c.lease_expires_at,
+                    (tasks.c.lease_expires_at < sa.func.now()).label("lease_expired"),
                 ).where(tasks.c.id == task_id)
             )
         )
@@ -166,10 +183,13 @@ async def _explain(
         reason = Rejection.ATTEMPT_MISMATCH
     elif expect_worker is not None and obs["lease_worker_id"] != expect_worker:
         reason = Rejection.WORKER_MISMATCH
+    elif expect_lease_expired and not obs["lease_expired"]:
+        reason = Rejection.LEASE_NOT_EXPIRED
     else:
         # The row matched on re-read but not during the UPDATE: another
         # transaction committed in between. Treat as contention.
         reason = Rejection.STATE_MISMATCH
+    del obs["lease_expired"]
     return TransitionResult(applied=False, rejection=reason, observed=obs)
 
 
