@@ -13,6 +13,7 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from acp.db.models import workers
+from acp.db.sqlutil import seconds
 
 
 async def register_worker(
@@ -50,10 +51,36 @@ async def register_worker(
     return dict(row)
 
 
-async def heartbeat(conn: AsyncConnection, *, worker_id: str) -> None:
-    await conn.execute(
-        sa.update(workers).where(workers.c.id == worker_id).values(last_heartbeat_at=sa.func.now())
+async def heartbeat(conn: AsyncConnection, *, worker_id: str) -> bool:
+    """Record liveness. Returns False if this worker has been declared DEAD.
+
+    The `status <> 'DEAD'` predicate is what makes death one-way. Without it a
+    worker that was marked dead -- because it was partitioned, paused, or just
+    slow -- would silently resurrect itself with its next heartbeat, and the
+    fleet's view of who is alive would be permanently wrong.
+
+    A False return is the worker's signal to SELF-FENCE: stop claiming, stop
+    renewing, and exit so its supervisor restarts it with a fresh,
+    generation-unique id. Nothing about task safety depends on this (ownership
+    is fenced by lease_worker_id + attempt), but without it a declared-dead
+    worker keeps claiming new work forever while every dashboard reports it
+    gone.
+    """
+    result = await conn.execute(
+        sa.update(workers)
+        .where(workers.c.id == worker_id, workers.c.status != "DEAD")
+        .values(last_heartbeat_at=sa.func.now())
     )
+    return result.rowcount == 1
+
+
+async def set_worker_status(conn: AsyncConnection, *, worker_id: str, status: str) -> None:
+    """Move a worker between ALIVE / DRAINING / DEAD.
+
+    Used by graceful shutdown so the fleet view distinguishes "stopping on
+    purpose" from "stopped answering", which are very different incidents.
+    """
+    await conn.execute(sa.update(workers).where(workers.c.id == worker_id).values(status=status))
 
 
 async def mark_dead_workers(conn: AsyncConnection, *, dead_after_s: int) -> Sequence[str]:
@@ -70,8 +97,7 @@ async def mark_dead_workers(conn: AsyncConnection, *, dead_after_s: int) -> Sequ
         sa.update(workers)
         .where(
             workers.c.status != "DEAD",
-            workers.c.last_heartbeat_at
-            < sa.func.now() - sa.text(f"interval '{dead_after_s} seconds'"),
+            workers.c.last_heartbeat_at < sa.func.now() - seconds(dead_after_s),
         )
         .values(status="DEAD")
         .returning(workers.c.id)

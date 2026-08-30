@@ -78,14 +78,17 @@ async def reap_task(
             },
             event_data={"lease_worker_id": lease_worker_id},
         )
-        outcome = "LOST"
     else:
         res = await transition(
             conn,
             task_id,
             expect_state=State.RUNNING,
             to_state=State.FAILED,
-            event_type=EventType.TASK_ABANDONED,
+            # TASK_FAILED, not TASK_ABANDONED: the task is ending because its
+            # attempts are exhausted. TASK_ABANDONED means a worker handed
+            # work back on purpose, which is the opposite of what happened
+            # here -- the worker stopped answering.
+            event_type=EventType.TASK_FAILED,
             expect_lease_expired=True,
             set_fields={
                 "finished_at": sa.func.now(),
@@ -94,9 +97,19 @@ async def reap_task(
                 "error_class": "LeaseExpired",
                 "error_message": error_message,
             },
-            event_data={"lease_worker_id": lease_worker_id},
+            event_data={"lease_worker_id": lease_worker_id, "reason": "attempts_exhausted"},
         )
-        outcome = "ABANDONED"
+
+    # LOST on BOTH paths. The attempt's outcome records what happened to the
+    # ATTEMPT -- its worker stopped answering and the work was taken back --
+    # which is true whether the task then requeued or ran out of attempts.
+    # The task-level outcome is already recorded in tasks.state; duplicating
+    # it here would lose the only signal that says "a worker died", and the
+    # chaos demo's verification counts exactly that:
+    #     SELECT count(*) FROM task_attempts WHERE outcome = 'LOST'
+    # Marking the exhausted case ABANDONED both undercounts recoveries and
+    # collides with the graceful-drain outcome, which genuinely is ABANDONED.
+    outcome = "LOST"
 
     if not res.applied:
         return False

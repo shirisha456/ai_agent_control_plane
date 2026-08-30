@@ -10,6 +10,7 @@ until its lease expires.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 
 from acp.config import Settings
@@ -32,10 +33,8 @@ class Reaper:
     async def run_forever(self) -> None:
         while not self._stopping.is_set():
             await self._sweep()
-            try:
+            with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._stopping.wait(), timeout=self.settings.reaper_period_s)
-            except asyncio.TimeoutError:
-                pass
 
     async def _sweep(self) -> None:
         # Drain the whole backlog, not just one batch: recovery latency is

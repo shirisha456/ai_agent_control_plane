@@ -17,8 +17,9 @@ from uuid import UUID
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncConnection
 
-from acp.db.models import task_events, tasks
-from acp.domain.states import EventType, State
+from acp.db.models import tasks
+from acp.db.sqlutil import seconds
+from acp.domain.states import State
 
 
 async def renew_lease(
@@ -43,9 +44,18 @@ async def renew_lease(
             tasks.c.state == State.RUNNING.value,
             tasks.c.attempt == expect_attempt,
             tasks.c.lease_worker_id == worker_id,
+            # You cannot renew a lease you have already lost. Without this
+            # clause a worker returning from a long pause (GC, VM freeze,
+            # partition) silently re-extends a lease that had already
+            # expired -- the very operation meant to MAINTAIN ownership would
+            # be the one that defeats the fence. The attempt check still
+            # catches the case where someone else reclaimed the task, but
+            # only this makes "expired" mean "lost" unconditionally, instead
+            # of "lost, if the reaper happened to get there first".
+            tasks.c.lease_expires_at > sa.func.now(),
         )
         .values(
-            lease_expires_at=sa.func.now() + sa.text(f"interval '{lease_ttl_s} seconds'"),
+            lease_expires_at=sa.func.now() + seconds(lease_ttl_s),
             updated_at=sa.func.now(),
         )
         .returning(tasks.c.cancel_requested, tasks.c.lease_expires_at)
@@ -54,13 +64,10 @@ async def renew_lease(
     if row is None:
         return None
 
-    await conn.execute(
-        sa.insert(task_events).values(
-            task_id=task_id,
-            attempt=expect_attempt,
-            event_type=EventType.LEASE_RENEWED.value,
-            worker_id=worker_id,
-            data={},
-        )
-    )
+    # Deliberately NO event on a successful renewal. A renewal per task per
+    # renew-interval is the highest-frequency operation in the system: at
+    # 1,000 concurrent tasks and a 7s interval that is ~143 task_events rows
+    # per second of pure noise, in the table whose retention we already have
+    # to manage. Renewal success is derivable from lease_expires_at anyway.
+    # Renewal FAILURE is the interesting event, and the caller records it.
     return dict(row)

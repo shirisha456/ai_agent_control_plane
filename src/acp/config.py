@@ -38,6 +38,10 @@ class Settings(BaseSettings):
     # --- scheduling ------------------------------------------------------
     poll_interval_ms: int = 250
     claim_batch_size: int = 5
+    # How long a stopping worker lets in-flight attempts finish before
+    # handing them back. Docker's default SIGTERM->SIGKILL window is 10s,
+    # so staying under it keeps graceful shutdown actually graceful.
+    drain_grace_s: float = 5.0
 
     def validate_timing(self) -> None:
         """Fail fast on a configuration that guarantees spurious lease loss."""

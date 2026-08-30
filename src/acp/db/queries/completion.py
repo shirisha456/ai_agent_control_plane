@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from acp.db.models import task_attempts
 from acp.db.queries.transitions import TransitionResult, transition
+from acp.db.sqlutil import seconds
 from acp.domain.states import EventType, State
 
 
@@ -92,7 +93,7 @@ async def complete_retry(
         expect_attempt=attempt,
         expect_worker=worker_id,
         set_fields={
-            "available_at": sa.func.now() + sa.text(f"interval '{backoff_s} seconds'"),
+            "available_at": sa.func.now() + seconds(backoff_s),
             "lease_worker_id": None,
             "lease_expires_at": None,
             "error_class": error_class,
@@ -102,7 +103,12 @@ async def complete_retry(
     )
     if res.applied:
         await finish_attempt(
-            conn, task_id, attempt, outcome="FAILED", error_class=error_class, error_message=error_message
+            conn,
+            task_id,
+            attempt,
+            outcome="FAILED",
+            error_class=error_class,
+            error_message=error_message,
         )
     return res
 
@@ -134,7 +140,12 @@ async def complete_failed(
     )
     if res.applied:
         await finish_attempt(
-            conn, task_id, attempt, outcome="FAILED", error_class=error_class, error_message=error_message
+            conn,
+            task_id,
+            attempt,
+            outcome="FAILED",
+            error_class=error_class,
+            error_message=error_message,
         )
     return res
 
@@ -162,4 +173,48 @@ async def complete_cancelled(
     )
     if res.applied:
         await finish_attempt(conn, task_id, attempt, outcome="CANCELLED")
+    return res
+
+
+async def complete_abandoned(
+    conn: AsyncConnection,
+    task_id: UUID,
+    *,
+    attempt: int,
+    worker_id: str,
+    reason: str,
+) -> TransitionResult:
+    """Hand a task back voluntarily, on graceful shutdown.
+
+    This is the FAST recovery path. A worker stopping cleanly returns its work
+    with available_at = now(), so another worker picks it up in milliseconds.
+    The SLOW path -- waiting a full lease_ttl for the reaper to notice -- is
+    only for workers that die without warning.
+
+    Two recovery paths with very different latencies, both measurable, is
+    worth having: graceful shutdown recovers in ~0s, SIGKILL in ~lease_ttl.
+    The gap between those two numbers is a benchmark result.
+
+    Note the outcome is ABANDONED, distinct from the reaper's LOST. "I gave
+    this back" and "this was taken from me because I stopped answering" are
+    different failure modes and the execution history should not conflate
+    them.
+    """
+    res = await transition(
+        conn,
+        task_id,
+        expect_state=State.RUNNING,
+        to_state=State.QUEUED,
+        event_type=EventType.TASK_ABANDONED,
+        expect_attempt=attempt,
+        expect_worker=worker_id,
+        set_fields={
+            "available_at": sa.func.now(),
+            "lease_worker_id": None,
+            "lease_expires_at": None,
+        },
+        event_data={"reason": reason},
+    )
+    if res.applied:
+        await finish_attempt(conn, task_id, attempt, outcome="ABANDONED", error_class=reason)
     return res

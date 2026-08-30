@@ -125,3 +125,19 @@ async def make_worker(engine: AsyncEngine):
         return worker_id
 
     return _make
+
+
+@pytest.fixture
+async def clean_tasks(engine: AsyncEngine):
+    """Delete all execution state before a test runs.
+
+    Most suites tolerate leftover rows because they assert on their own task
+    ids. Tests that assert "the claim query returned MY task" or "this
+    timeline is exactly these events" cannot, because another test's QUEUED
+    work competes for the same claim. Deleting tasks cascades to
+    task_attempts and task_events, so one statement resets execution state
+    without touching the tenant or worker registries.
+    """
+    async with engine.connect() as conn, conn.begin():
+        await conn.execute(sa.delete(tasks))
+    yield

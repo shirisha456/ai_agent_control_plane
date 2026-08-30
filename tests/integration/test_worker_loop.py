@@ -74,7 +74,11 @@ async def test_worker_claims_and_succeeds(engine, make_task, monkeypatch) -> Non
 
     async with engine.connect() as conn:
         row = (
-            (await conn.execute(sa.select(tasks.c.result, tasks.c.attempt).where(tasks.c.id == task_id)))
+            (
+                await conn.execute(
+                    sa.select(tasks.c.result, tasks.c.attempt).where(tasks.c.id == task_id)
+                )
+            )
             .mappings()
             .one()
         )

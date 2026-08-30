@@ -50,6 +50,7 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from acp.db.models import task_attempts, task_events, tasks, tenants
+from acp.db.sqlutil import seconds
 from acp.domain.states import EventType, State
 from acp.scheduling.policy import ClaimPolicy
 
@@ -134,7 +135,7 @@ async def claim_tasks(
     if not claimed_ids:
         return []
 
-    lease_expires_at = sa.func.now() + sa.text(f"interval '{lease_ttl_s} seconds'")
+    lease_expires_at = sa.func.now() + seconds(lease_ttl_s)
     stmt = (
         sa.update(tasks)
         .where(tasks.c.id.in_(claimed_ids))

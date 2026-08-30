@@ -113,7 +113,9 @@ async def test_reap_fails_task_with_exhausted_attempts(engine, make_task, make_w
         )
     assert row["state"] == State.FAILED.value
     assert row["finished_at"] is not None
-    assert attempt_row["outcome"] == "ABANDONED"
+    # LOST, not ABANDONED: the worker stopped answering. ABANDONED is
+    # reserved for a worker handing work back on purpose during drain.
+    assert attempt_row["outcome"] == "LOST"
 
 
 async def test_reap_ignores_tasks_with_live_leases(engine, make_task, make_worker) -> None:

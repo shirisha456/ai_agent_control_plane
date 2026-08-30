@@ -7,11 +7,11 @@ buys.
 from __future__ import annotations
 
 from acp.scheduling.policy import (
+    PRIORITY_FIFO,
     READY_INDEX_COLUMNS,
+    ClaimPolicy,
     Direction,
     SortKey,
-    ClaimPolicy,
-    PRIORITY_FIFO,
 )
 
 

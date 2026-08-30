@@ -10,3 +10,4 @@ venv/
 htmlcov/
 load/results/
 *.log
+CLAUDE.md

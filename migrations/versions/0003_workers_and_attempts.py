@@ -45,7 +45,10 @@ def upgrade() -> None:
         # more than this -- capacity is enforced where it is known.
         sa.Column("capacity", sa.Integer, nullable=False),
         sa.Column(
-            "capabilities", pg.ARRAY(sa.Text), nullable=False, server_default=sa.text("'{}'::text[]")
+            "capabilities",
+            pg.ARRAY(sa.Text),
+            nullable=False,
+            server_default=sa.text("'{}'::text[]"),
         ),
         sa.Column(
             "status",

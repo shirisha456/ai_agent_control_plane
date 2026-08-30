@@ -157,10 +157,15 @@ task_attempts = sa.Table(
     "task_attempts",
     metadata,
     sa.Column(
-        "task_id", pg.UUID(as_uuid=True), sa.ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False
+        "task_id",
+        pg.UUID(as_uuid=True),
+        sa.ForeignKey("tasks.id", ondelete="CASCADE"),
+        nullable=False,
     ),
     sa.Column("attempt", sa.Integer, nullable=False),
-    sa.Column("worker_id", sa.Text, sa.ForeignKey("workers.id", ondelete="RESTRICT"), nullable=False),
+    sa.Column(
+        "worker_id", sa.Text, sa.ForeignKey("workers.id", ondelete="RESTRICT"), nullable=False
+    ),
     sa.Column("started_at", TS, nullable=False, server_default=sa.text("now()")),
     sa.Column("finished_at", TS),
     sa.Column("outcome", attempt_outcome),

@@ -87,13 +87,17 @@ async def test_claim_respects_tenant_concurrency_limit(
     b = await make_task()
 
     async with engine.connect() as conn, conn.begin():
-        first = await claim_tasks(conn, worker_id=w1, limit=5, lease_ttl_s=30, policy=DEFAULT_POLICY)
+        first = await claim_tasks(
+            conn, worker_id=w1, limit=5, lease_ttl_s=30, policy=DEFAULT_POLICY
+        )
     assert [c["id"] for c in first] == [a]
 
     # Tenant is now at its limit (one RUNNING task): the second task must not
     # be claimable even though it is QUEUED and eligible on every other axis.
     async with engine.connect() as conn, conn.begin():
-        second = await claim_tasks(conn, worker_id=w2, limit=5, lease_ttl_s=30, policy=DEFAULT_POLICY)
+        second = await claim_tasks(
+            conn, worker_id=w2, limit=5, lease_ttl_s=30, policy=DEFAULT_POLICY
+        )
     assert second == []
     assert b  # unclaimed, still QUEUED
 

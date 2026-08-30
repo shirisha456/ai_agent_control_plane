@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import signal
 
@@ -18,10 +19,9 @@ async def main() -> None:
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
+        # Windows has no SIGTERM handler; SIGINT (Ctrl+C) still works.
+        with contextlib.suppress(NotImplementedError):
             loop.add_signal_handler(sig, reaper.stop)
-        except NotImplementedError:
-            pass  # Windows has no SIGTERM handler; SIGINT (Ctrl+C) still works.
 
     try:
         await reaper.run_forever()
