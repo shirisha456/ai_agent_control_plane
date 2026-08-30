@@ -23,6 +23,16 @@ task_state = pg.ENUM(
     name="task_state",
     create_type=False,
 )
+worker_status = pg.ENUM("ALIVE", "DRAINING", "DEAD", name="worker_status", create_type=False)
+attempt_outcome = pg.ENUM(
+    "SUCCEEDED",
+    "FAILED",
+    "LOST",
+    "ABANDONED",
+    "CANCELLED",
+    name="attempt_outcome",
+    create_type=False,
+)
 
 TS = sa.TIMESTAMP(timezone=True)
 
@@ -78,6 +88,11 @@ tasks = sa.Table(
     # The lease, inlined rather than in its own table: lease grant and state
     # transition must be atomic anyway, so a separate row buys only a join on
     # the hottest query in the system. See docs/adr/0004.
+    # No FOREIGN KEY to workers, deliberately. The lease pointer's integrity
+    # comes from the fencing protocol, not from referential integrity: an
+    # expired lease is reclaimed whether or not the worker row still exists,
+    # so an FK would assert a fact the protocol does not rely on -- while
+    # adding a constraint check to the single hottest write in the system.
     sa.Column("lease_worker_id", sa.Text),
     sa.Column("lease_expires_at", TS),
     sa.Column("cancel_requested", sa.Boolean, nullable=False, server_default=sa.text("false")),
@@ -117,4 +132,40 @@ task_events = sa.Table(
     sa.Column("worker_id", sa.Text),
     sa.Column("data", pg.JSONB, nullable=False, server_default=sa.text("'{}'::jsonb")),
     sa.Column("created_at", TS, nullable=False, server_default=sa.text("now()")),
+)
+
+
+workers = sa.Table(
+    "workers",
+    metadata,
+    # Generation-unique: a fresh id per process start. See migration 0003.
+    sa.Column("id", sa.Text, primary_key=True),
+    sa.Column("hostname", sa.Text, nullable=False),
+    sa.Column("pid", sa.Integer, nullable=False),
+    sa.Column("capacity", sa.Integer, nullable=False),
+    sa.Column(
+        "capabilities", pg.ARRAY(sa.Text), nullable=False, server_default=sa.text("'{}'::text[]")
+    ),
+    sa.Column("status", worker_status, nullable=False, server_default="ALIVE"),
+    sa.Column("registered_at", TS, nullable=False, server_default=sa.text("now()")),
+    sa.Column("last_heartbeat_at", TS, nullable=False, server_default=sa.text("now()")),
+    sa.CheckConstraint("capacity >= 1", name="ck_workers_capacity"),
+)
+
+
+task_attempts = sa.Table(
+    "task_attempts",
+    metadata,
+    sa.Column(
+        "task_id", pg.UUID(as_uuid=True), sa.ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False
+    ),
+    sa.Column("attempt", sa.Integer, nullable=False),
+    sa.Column("worker_id", sa.Text, sa.ForeignKey("workers.id", ondelete="RESTRICT"), nullable=False),
+    sa.Column("started_at", TS, nullable=False, server_default=sa.text("now()")),
+    sa.Column("finished_at", TS),
+    sa.Column("outcome", attempt_outcome),
+    sa.Column("error_class", sa.Text),
+    sa.Column("error_message", sa.Text),
+    # (task_id, attempt) is a duplicate-execution guard, not merely a key.
+    sa.PrimaryKeyConstraint("task_id", "attempt", name="pk_task_attempts"),
 )

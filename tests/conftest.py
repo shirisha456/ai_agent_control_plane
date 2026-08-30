@@ -22,7 +22,7 @@ from alembic.config import Config
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 from sqlalchemy.pool import NullPool
 
-from acp.db.models import tasks, tenants
+from acp.db.models import tasks, tenants, workers
 from acp.platform import event_loop_policy as _policy
 
 TEST_URL = os.environ.get(
@@ -103,5 +103,25 @@ async def make_task(engine: AsyncEngine, tenant_id: uuid.UUID):
             return (
                 await c.execute(sa.insert(tasks).values(**values).returning(tasks.c.id))
             ).scalar_one()
+
+    return _make
+
+
+@pytest.fixture
+async def make_worker(engine: AsyncEngine):
+    """Factory registering a worker row, so task_attempts.worker_id FK is satisfiable."""
+
+    async def _make(worker_id: str | None = None, **overrides) -> str:
+        worker_id = worker_id or f"worker-{uuid.uuid4().hex[:8]}"
+        values: dict = {
+            "id": worker_id,
+            "hostname": "test-host",
+            "pid": 1,
+            "capacity": 5,
+        }
+        values.update(overrides)
+        async with engine.connect() as c, c.begin():
+            await c.execute(sa.insert(workers).values(**values))
+        return worker_id
 
     return _make
