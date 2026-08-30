@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
 from acp.api.errors import install_error_handlers
-from acp.api.routes import health, tasks, tenants
+from acp.api.routes import health, metrics, tasks, tenants
 from acp.config import settings
-from acp.db.session import dispose_engine
+from acp.db.session import dispose_engine, engine
+from acp.obs.gauges import run_refresher
 from acp.obs.logging import configure_logging, get_logger
 
 log = get_logger(__name__)
@@ -24,9 +27,19 @@ async def lifespan(app: FastAPI):
         worker_dead_after_s=s.worker_dead_after_s,
         recovery_bound_s=s.lease_ttl_s + s.reaper_period_s,
     )
-    yield
-    await dispose_engine()
-    log.info("api.stop")
+    stop = asyncio.Event()
+    refresher = asyncio.create_task(
+        run_refresher(engine(), interval_s=s.gauge_refresh_s, stop=stop)
+    )
+    try:
+        yield
+    finally:
+        stop.set()
+        refresher.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await refresher
+        await dispose_engine()
+        log.info("api.stop")
 
 
 app = FastAPI(
@@ -37,6 +50,7 @@ app = FastAPI(
 )
 install_error_handlers(app)
 app.include_router(health.router)
+app.include_router(metrics.router)
 app.include_router(tenants.router)
 app.include_router(tasks.router)
 

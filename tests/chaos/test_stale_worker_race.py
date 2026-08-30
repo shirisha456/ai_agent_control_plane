@@ -80,7 +80,7 @@ async def test_stale_worker_cannot_overwrite_the_new_owner(engine, make_task, ma
     #    token is allocated by whoever claims next, so ownership and token are
     #    granted by the same statement and can never disagree.
     async with engine.connect() as conn, conn.begin():
-        assert await reap_expired_leases(conn, limit=10) == 1
+        assert (await reap_expired_leases(conn, limit=10)).reaped == 1
 
     async with engine.connect() as conn:
         row = (
@@ -193,7 +193,7 @@ async def test_reaper_loses_to_a_worker_that_renews_in_time(engine, make_task, m
         )
 
     async with engine.connect() as conn, conn.begin():
-        assert await reap_expired_leases(conn, limit=10) == 0
+        assert (await reap_expired_leases(conn, limit=10)).reaped == 0
 
     async with engine.connect() as conn:
         state = (
@@ -225,7 +225,7 @@ async def test_concurrent_reap_and_completion_produce_one_outcome(
 
     async def reap():
         async with engine.connect() as conn, conn.begin():
-            return await reap_expired_leases(conn, limit=10)
+            return (await reap_expired_leases(conn, limit=10)).reaped
 
     finished, reaped = await asyncio.gather(finish(), reap())
 

@@ -21,6 +21,7 @@ from acp.api.errors import Conflict, NotFound
 from acp.api.schemas import CancelOut, TaskCreate, TaskEventOut, TaskListOut, TaskOut
 from acp.db.queries import tasks as q
 from acp.domain.states import State
+from acp.obs import metrics
 
 router = APIRouter(prefix="/v1/tasks", tags=["tasks"])
 
@@ -70,6 +71,14 @@ async def submit(body: TaskCreate, response: Response, conn: Txn) -> TaskOut:
         ) from exc
     except LookupError as exc:
         raise Conflict(str(exc), retry_after_s=1) from exc
+
+    # `deduplicated` as a label rather than two metrics: the ratio of
+    # deduplicated to created submissions is exactly the question worth asking
+    # (how hard are clients retrying?), and a ratio is easier to read off one
+    # metric than off two.
+    metrics.tasks_submitted.labels(
+        task_type=body.task_type, deduplicated=str(not result.created).lower()
+    ).inc()
 
     if not result.created:
         response.status_code = status.HTTP_200_OK

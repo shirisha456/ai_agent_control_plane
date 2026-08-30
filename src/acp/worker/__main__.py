@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import logging
 import signal
 
 from acp.agent.adapters.base import AdapterRegistry
 from acp.agent.adapters.demo import register_demo_adapters
 from acp.config import settings
 from acp.db.session import dispose_engine
+from acp.obs.exporter import start_exporter
+from acp.obs.logging import configure_logging
 from acp.platform import install_event_loop_policy
 from acp.worker.loop import Worker
 
@@ -22,7 +23,9 @@ def build_registry() -> AdapterRegistry:
 
 
 async def main() -> None:
-    logging.basicConfig(level=settings().log_level)
+    s = settings()
+    configure_logging(s.log_level, s.log_format)
+    start_exporter(s.metrics_port)
     worker = Worker(settings=settings(), registry=build_registry())
 
     loop = asyncio.get_running_loop()

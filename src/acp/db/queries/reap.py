@@ -17,6 +17,7 @@ second guard.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID
 
@@ -37,7 +38,18 @@ async def find_expired_leases(conn: AsyncConnection, *, limit: int) -> list[Mapp
     both trying to reclaim the same task.
     """
     stmt = (
-        sa.select(tasks.c.id, tasks.c.attempt, tasks.c.max_attempts, tasks.c.lease_worker_id)
+        sa.select(
+            tasks.c.id,
+            tasks.c.attempt,
+            tasks.c.max_attempts,
+            tasks.c.lease_worker_id,
+            # How long the lease had ALREADY been expired when we found it.
+            # Computed by PostgreSQL, not by subtracting a Python clock from a
+            # database timestamp -- the recovery-latency histogram this feeds
+            # is the number we claim as `lease_ttl_s + reaper_period_s`, so it
+            # must not be measured against a second, drifting clock.
+            sa.extract("epoch", sa.func.now() - tasks.c.lease_expires_at).label("overdue_s"),
+        )
         .where(tasks.c.state == State.RUNNING.value, tasks.c.lease_expires_at < sa.func.now())
         .order_by(tasks.c.lease_expires_at)
         .limit(limit)
@@ -133,11 +145,35 @@ async def reap_task(
     return True
 
 
-async def reap_expired_leases(conn: AsyncConnection, *, limit: int) -> int:
-    """Find and recover up to `limit` expired-lease tasks. Returns how many were reaped."""
+@dataclass(slots=True)
+class ReapResult:
+    """What one reaper pass actually did.
+
+    Richer than a count because the interesting questions are "how overdue
+    were these?" (is the reaper keeping up with its own SLA) and "how many
+    ran out of attempts?" (is something poisoning workers) -- neither of
+    which a single integer can answer.
+    """
+
+    requeued: int = 0
+    failed_exhausted: int = 0
+    #: Seconds each reclaimed lease had been expired before we got to it.
+    overdue_s: list[float] = field(default_factory=list)
+
+    @property
+    def reaped(self) -> int:
+        return self.requeued + self.failed_exhausted
+
+    def __int__(self) -> int:
+        return self.reaped
+
+
+async def reap_expired_leases(conn: AsyncConnection, *, limit: int) -> ReapResult:
+    """Find and recover up to `limit` expired-lease tasks."""
     candidates = await find_expired_leases(conn, limit=limit)
-    reaped = 0
+    result = ReapResult()
     for row in candidates:
+        exhausted = row["attempt"] >= row["max_attempts"]
         if await reap_task(
             conn,
             row["id"],
@@ -145,5 +181,9 @@ async def reap_expired_leases(conn: AsyncConnection, *, limit: int) -> int:
             max_attempts=row["max_attempts"],
             lease_worker_id=row["lease_worker_id"],
         ):
-            reaped += 1
-    return reaped
+            if exhausted:
+                result.failed_exhausted += 1
+            else:
+                result.requeued += 1
+            result.overdue_s.append(float(row["overdue_s"]))
+    return result

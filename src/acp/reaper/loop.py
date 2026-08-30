@@ -11,20 +11,25 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import logging
+import time
 
 from acp.config import Settings
 from acp.db.queries.reap import reap_expired_leases
 from acp.db.queries.workers import mark_dead_workers
 from acp.db.session import transaction
+from acp.obs import metrics
+from acp.obs.logging import get_logger
 
-logger = logging.getLogger("acp.reaper")
+logger = get_logger("acp.reaper")
 
 
 class Reaper:
-    def __init__(self, *, settings: Settings, batch_size: int = 100) -> None:
+    def __init__(
+        self, *, settings: Settings, batch_size: int = 100, max_batches_per_sweep: int = 50
+    ) -> None:
         self.settings = settings
         self.batch_size = batch_size
+        self.max_batches_per_sweep = max_batches_per_sweep
         self._stopping = asyncio.Event()
 
     def stop(self) -> None:
@@ -41,17 +46,37 @@ class Reaper:
         # documented as lease_ttl_s + reaper_period_s, which only holds if a
         # burst of simultaneous failures doesn't get throttled to
         # batch_size-per-period.
-        total_reaped = 0
-        while not self._stopping.is_set():
-            async with transaction() as conn:
-                reaped = await reap_expired_leases(conn, limit=self.batch_size)
-            total_reaped += reaped
-            if reaped < self.batch_size:
+        started = time.monotonic()
+        requeued = failed = 0
+        # Bounded: without a cap, a retry storm that produces expired leases
+        # faster than we reclaim them keeps this loop inside a single sweep
+        # forever, so the worker-liveness pass below never runs and the
+        # reaper stops doing half its job while looking perfectly busy.
+        for _ in range(self.max_batches_per_sweep):
+            if self._stopping.is_set():
                 break
-        if total_reaped:
-            logger.warning("reaper.leases_reclaimed count=%d", total_reaped)
+            async with transaction() as conn:
+                result = await reap_expired_leases(conn, limit=self.batch_size)
+            requeued += result.requeued
+            failed += result.failed_exhausted
+            for overdue in result.overdue_s:
+                metrics.recovery_latency.observe(overdue)
+            if result.reaped:
+                metrics.lease_expirations.inc(result.reaped)
+            if result.reaped < self.batch_size:
+                break
+
+        if requeued:
+            metrics.task_recoveries.labels(disposition="requeued").inc(requeued)
+        if failed:
+            metrics.task_recoveries.labels(disposition="failed_exhausted").inc(failed)
+        if requeued or failed:
+            logger.warning("reaper.leases_reclaimed", requeued=requeued, failed_exhausted=failed)
 
         async with transaction() as conn:
             dead = await mark_dead_workers(conn, dead_after_s=self.settings.worker_dead_after_s)
         if dead:
-            logger.warning("reaper.workers_marked_dead ids=%s", list(dead))
+            metrics.workers_marked_dead.inc(len(dead))
+            logger.warning("reaper.workers_marked_dead", count=len(dead), ids=list(dead))
+
+        metrics.reaper_sweep_duration.observe(time.monotonic() - started)

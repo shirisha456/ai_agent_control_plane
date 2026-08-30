@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import logging
 import os
 import socket
 import time
@@ -33,9 +32,11 @@ from acp.db.queries.transitions import record_event
 from acp.db.queries.workers import heartbeat, register_worker, set_worker_status
 from acp.db.session import transaction
 from acp.domain.states import EventType
+from acp.obs import metrics
+from acp.obs.logging import get_logger
 from acp.scheduling.policy import DEFAULT_POLICY, ClaimPolicy
 
-logger = logging.getLogger("acp.worker")
+logger = get_logger("acp.worker")
 
 
 def new_worker_id() -> str:
@@ -109,7 +110,11 @@ class Worker:
                 free = self.capacity - len(self._inflight)
                 if free > 0:
                     await self._claim_and_dispatch(free)
-                self._inflight = {t for t in self._inflight if not t.done()}
+                # Retrieve results before dropping finished tasks. Without
+                # this, an exception raised inside _run_attempt vanishes with
+                # the Task object and the worker silently stops finalising
+                # attempts while still looking healthy.
+                self._inflight = self._harvest(self._inflight)
                 await asyncio.wait(
                     [asyncio.ensure_future(self._sleep_poll())] + list(self._inflight),
                     return_when=asyncio.FIRST_COMPLETED,
@@ -169,6 +174,56 @@ class Worker:
         except Exception:  # noqa: BLE001
             logger.warning("worker.final_status_failed id=%s", self.worker_id, exc_info=True)
 
+    def _record_outcome(
+        self,
+        task_type: str,
+        outcome: str,
+        detail: Any,
+        cancel_requested: bool,
+        attempt: int,
+        max_attempts: int,
+    ) -> None:
+        """Count what actually happened, mirroring _finalize's branches.
+
+        Only called when the transition APPLIED. Counting an outcome we were
+        fenced out of would inflate throughput with work another worker
+        actually did -- the metric would say the task succeeded here when it
+        succeeded somewhere else.
+        """
+        error_class = metrics.normalize_error_class(
+            type(detail).__name__ if isinstance(detail, Exception) else None
+        )
+        if cancel_requested:
+            attempt_outcome, task_state = "CANCELLED", "CANCELLED"
+        elif outcome == "succeeded":
+            attempt_outcome, task_state = "SUCCEEDED", "SUCCEEDED"
+        elif outcome == "retryable" and attempt < max_attempts:
+            metrics.tasks_retried.labels(task_type=task_type, error_class=error_class).inc()
+            # The attempt finished; the TASK has not reached a terminal state,
+            # so it is deliberately absent from tasks_terminal_total. Conflating
+            # the two would make "tasks completed" count retries.
+            metrics.task_attempts_finished.labels(task_type=task_type, outcome="FAILED").inc()
+            return
+        else:
+            attempt_outcome, task_state = "FAILED", "FAILED"
+
+        metrics.task_attempts_finished.labels(task_type=task_type, outcome=attempt_outcome).inc()
+        metrics.tasks_terminal.labels(task_type=task_type, state=task_state).inc()
+
+    def _harvest(self, tasks_: set[asyncio.Task[None]]) -> set[asyncio.Task[None]]:
+        """Drop completed attempt tasks, surfacing anything they raised."""
+        still_running = set()
+        for task in tasks_:
+            if not task.done():
+                still_running.add(task)
+                continue
+            if task.cancelled():
+                continue
+            exc = task.exception()
+            if exc is not None:
+                logger.error("worker.attempt_crashed", worker_id=self.worker_id, exc_info=exc)
+        return still_running
+
     async def _sleep_poll(self) -> None:
         await asyncio.sleep(self.settings.poll_interval_ms / 1000)
 
@@ -187,11 +242,13 @@ class Worker:
             # declared-dead worker that keeps claiming makes every dashboard
             # wrong and wastes a slot's worth of duplicate execution. Stop,
             # and let the supervisor restart us with a fresh id.
-            logger.error("worker.fenced id=%s declared DEAD by the control plane", self.worker_id)
+            logger.error("worker.fenced", worker_id=self.worker_id)
+            metrics.workers_self_fenced.inc()
             self._fenced = True
             self._stopping.set()
 
     async def _claim_and_dispatch(self, limit: int) -> None:
+        started = time.monotonic()
         async with transaction() as conn:
             claimed = await claim_tasks(
                 conn,
@@ -200,7 +257,17 @@ class Worker:
                 lease_ttl_s=self.settings.lease_ttl_s,
                 policy=self.policy,
             )
+        metrics.claim_duration.observe(time.monotonic() - started)
+        metrics.claim_batch.observe(len(claimed))
+
         for row in claimed:
+            # Queue wait measured entirely from database timestamps:
+            # `updated_at` was set to now() by the claim UPDATE and
+            # `available_at` by whoever queued it. Subtracting a local clock
+            # from a database timestamp would fold this machine's skew into
+            # the latency histogram.
+            wait_s = (row["updated_at"] - row["available_at"]).total_seconds()
+            metrics.queue_wait.labels(task_type=row["task_type"]).observe(max(0.0, wait_s))
             self._inflight.add(asyncio.ensure_future(self._run_attempt(row)))
 
     async def _run_attempt(self, row: Mapping[str, Any]) -> None:
@@ -225,7 +292,13 @@ class Worker:
 
         try:
             await self._finalize(
-                task_id, attempt, row["max_attempts"], outcome, detail, cancelled.is_set()
+                task_id,
+                attempt,
+                row["max_attempts"],
+                outcome,
+                detail,
+                cancelled.is_set(),
+                task_type=task_type,
             )
         finally:
             # Ownership ends here whether or not the transition applied: if it
@@ -278,6 +351,7 @@ class Worker:
         outcome: str,
         detail: Any,
         cancel_requested: bool,
+        task_type: str = "unknown",
     ) -> None:
         async with transaction() as conn:
             if outcome == "succeeded":
@@ -316,13 +390,20 @@ class Worker:
                     error_class=type(detail).__name__ if isinstance(detail, Exception) else "Error",
                     error_message=str(detail),
                 )
+        if res.applied:
+            self._record_outcome(
+                task_type, outcome, detail, cancel_requested, attempt, max_attempts
+            )
+
         if not res.applied:
+            rejection = res.rejection.value if res.rejection else "unknown"
+            metrics.stale_writes_rejected.labels(rejection=rejection).inc()
             logger.warning(
-                "worker.stale_write_rejected task=%s attempt=%s rejection=%s worker=%s",
-                task_id,
-                attempt,
-                res.rejection,
-                self.worker_id,
+                "worker.stale_write_rejected",
+                task_id=str(task_id),
+                attempt=attempt,
+                rejection=rejection,
+                worker_id=self.worker_id,
             )
             # Record it in the database, not just the log. A non-zero count of
             # these is the PROOF that fencing works, and the chaos demo's
@@ -344,7 +425,7 @@ class Worker:
                         worker_id=self.worker_id,
                         data={
                             "operation": outcome,
-                            "rejection": res.rejection.value if res.rejection else None,
+                            "rejection": rejection,
                         },
                     )
             except Exception:  # noqa: BLE001 - never let bookkeeping mask the real event

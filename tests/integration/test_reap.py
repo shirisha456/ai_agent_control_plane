@@ -37,7 +37,7 @@ async def test_reap_requeues_task_with_remaining_attempts(engine, make_task, mak
     await _insert_attempt_row(engine, task_id, 1, worker_id)
 
     async with engine.connect() as conn, conn.begin():
-        reaped = await reap_expired_leases(conn, limit=10)
+        reaped = (await reap_expired_leases(conn, limit=10)).reaped
     assert reaped == 1
 
     async with engine.connect() as conn:
@@ -87,7 +87,7 @@ async def test_reap_fails_task_with_exhausted_attempts(engine, make_task, make_w
     await _insert_attempt_row(engine, task_id, 3, worker_id)
 
     async with engine.connect() as conn, conn.begin():
-        reaped = await reap_expired_leases(conn, limit=10)
+        reaped = (await reap_expired_leases(conn, limit=10)).reaped
     assert reaped == 1
 
     async with engine.connect() as conn:
@@ -128,7 +128,7 @@ async def test_reap_ignores_tasks_with_live_leases(engine, make_task, make_worke
     )
 
     async with engine.connect() as conn, conn.begin():
-        reaped = await reap_expired_leases(conn, limit=10)
+        reaped = (await reap_expired_leases(conn, limit=10)).reaped
     assert reaped == 0
 
     async with engine.connect() as conn:

@@ -43,6 +43,14 @@ class Settings(BaseSettings):
     # so staying under it keeps graceful shutdown actually graceful.
     drain_grace_s: float = 5.0
 
+    # --- observability ---------------------------------------------------
+    # Workers and the reaper are separate processes, so each exposes its own
+    # scrape endpoint. The API serves DB-derived gauges; per-process counters
+    # come from the process that owns them, which is the only way a counter
+    # can be correct without cross-process coordination.
+    metrics_port: int = 0  # 0 disables the standalone exporter
+    gauge_refresh_s: float = 5.0
+
     def validate_timing(self) -> None:
         """Fail fast on a configuration that guarantees spurious lease loss."""
         if self.lease_ttl_s <= 3 * self.lease_renew_interval_s:
