@@ -24,6 +24,7 @@ task_state = pg.ENUM(
     create_type=False,
 )
 worker_status = pg.ENUM("ALIVE", "DRAINING", "DEAD", name="worker_status", create_type=False)
+tool_status = pg.ENUM("ACTIVE", "DISABLED", name="tool_status", create_type=False)
 agent_status = pg.ENUM("ACTIVE", "DEPRECATED", "DISABLED", name="agent_status", create_type=False)
 version_status = pg.ENUM(
     "DRAFT", "ACTIVE", "DEPRECATED", "DISABLED", name="version_status", create_type=False
@@ -248,4 +249,54 @@ agent_routes = sa.Table(
     sa.Column("agent_id", pg.UUID(as_uuid=True), sa.ForeignKey("agents.id"), nullable=False),
     sa.Column("created_at", TS, nullable=False, server_default=sa.text("now()")),
     sa.PrimaryKeyConstraint("tenant_id", "request_type", name="pk_agent_routes"),
+)
+
+
+tools = sa.Table(
+    "tools",
+    metadata,
+    sa.Column(
+        "id", pg.UUID(as_uuid=True), primary_key=True, server_default=sa.text("gen_random_uuid()")
+    ),
+    sa.Column("tenant_id", pg.UUID(as_uuid=True), sa.ForeignKey("tenants.id"), nullable=False),
+    sa.Column("name", sa.Text, nullable=False),
+    sa.Column("description", sa.Text),
+    sa.Column("tool_type", sa.Text, nullable=False, server_default="SIMULATED"),
+    # Holds a REFERENCE to a credential, never a credential. See migration 0007.
+    sa.Column("config", pg.JSONB, nullable=False, server_default=sa.text("'{}'::jsonb")),
+    # The LIVE kill switch: overrides every grant, immediately.
+    sa.Column("status", tool_status, nullable=False, server_default="ACTIVE"),
+    sa.Column("created_at", TS, nullable=False, server_default=sa.text("now()")),
+    sa.UniqueConstraint("tenant_id", "name", name="uq_tools_tenant_name"),
+)
+
+
+agent_version_tool_grants = sa.Table(
+    "agent_version_tool_grants",
+    metadata,
+    sa.Column(
+        "agent_version_id",
+        pg.UUID(as_uuid=True),
+        sa.ForeignKey("agent_versions.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    sa.Column("tool_id", pg.UUID(as_uuid=True), sa.ForeignKey("tools.id"), nullable=False),
+    sa.Column("created_at", TS, nullable=False, server_default=sa.text("now()")),
+    sa.PrimaryKeyConstraint("agent_version_id", "tool_id", name="pk_agent_version_tool_grants"),
+)
+
+
+audit_events = sa.Table(
+    "audit_events",
+    metadata,
+    sa.Column("id", sa.BigInteger, primary_key=True, autoincrement=True),
+    sa.Column("tenant_id", pg.UUID(as_uuid=True), nullable=False),
+    sa.Column("actor", sa.Text, nullable=False, server_default="system"),
+    sa.Column("action", sa.Text, nullable=False),
+    sa.Column("resource_type", sa.Text, nullable=False),
+    # Deliberately no FK: audit records must outlive what they describe.
+    sa.Column("resource_id", pg.UUID(as_uuid=True)),
+    sa.Column("outcome", sa.Text, nullable=False),
+    sa.Column("data", pg.JSONB, nullable=False, server_default=sa.text("'{}'::jsonb")),
+    sa.Column("created_at", TS, nullable=False, server_default=sa.text("now()")),
 )

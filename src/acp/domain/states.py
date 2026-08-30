@@ -120,5 +120,14 @@ class EventType(StrEnum):
     STALE_WRITE_REJECTED = "STALE_WRITE_REJECTED"
     TASK_SUCCEEDED = "TASK_SUCCEEDED"
     TASK_FAILED = "TASK_FAILED"
+    # Tool-call history. ALLOW decisions and executions are execution
+    # history and live only here, pruned with the task. DENY decisions are
+    # written here AND to audit_events, because a refusal is a security
+    # signal that must outlive the task's retention -- and denials are rare
+    # by construction, so the duplication costs nothing.
+    TOOL_ACCESS_ALLOWED = "TOOL_ACCESS_ALLOWED"
+    TOOL_ACCESS_DENIED = "TOOL_ACCESS_DENIED"
+    TOOL_EXECUTED = "TOOL_EXECUTED"
+    TOOL_EXECUTION_FAILED = "TOOL_EXECUTION_FAILED"
     CANCEL_REQUESTED = "CANCEL_REQUESTED"
     TASK_CANCELLED = "TASK_CANCELLED"

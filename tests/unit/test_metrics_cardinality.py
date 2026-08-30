@@ -44,6 +44,14 @@ JUSTIFIED_LABELS = {
     "disposition": "requeued | failed_exhausted",
     "error_class": "normalised against KNOWN_ERROR_CLASSES",
     "deduplicated": "true | false",
+    # Bounded by the tools table, which is admin-controlled per tenant --
+    # the same argument as `tenant`, and with the same caveat: it grows
+    # with customers, not with traffic. Tool NAME rather than tool id so a
+    # dashboard is readable, and because the id adds cardinality without
+    # adding information.
+    "tool": "bounded by the admin-controlled tool registry",
+    "decision": "allowed | denied",
+    "reason": "the DenyReason enum",
 }
 
 

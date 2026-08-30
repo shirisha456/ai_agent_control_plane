@@ -19,6 +19,7 @@ from acp.config import Settings
 from acp.db.models import task_attempts, task_events, tasks, workers
 from acp.db.queries.workers import heartbeat
 from acp.domain.states import EventType, State
+from acp.obs import metrics
 from acp.worker.loop import Worker
 
 pytestmark = pytest.mark.db
@@ -267,4 +268,58 @@ async def test_drained_task_is_immediately_reclaimable(engine, make_task, monkey
 
     assert task_id in [r["id"] for r in claimed], (
         "a handed-back task should be claimable immediately, with no backoff"
+    )
+
+
+async def test_execution_duration_is_recorded_for_every_attempt(
+    engine, make_task, monkeypatch
+) -> None:
+    """A regression guard for instrumentation quietly going missing.
+
+    Metrics have no test of their own unless one is written: the worker runs
+    correctly whether or not it observes a histogram, so a lost
+    `.observe()` call passes every functional test and only shows up as a
+    permanently empty Grafana panel weeks later. This one failed for real --
+    an edit silently no-matched and took the execution-duration timing with
+    it, undetected until the tool-authorization work needed the same code
+    path.
+    """
+    import acp.worker.loop as loop_mod
+
+    monkeypatch.setattr(loop_mod, "transaction", _bind_transaction(engine))
+
+    def _count() -> float:
+        return sum(
+            sample.value
+            for metric in metrics.REGISTRY.collect()
+            if metric.name == "acp_execution_duration_seconds"
+            for sample in metric.samples
+            if sample.name.endswith("_count")
+        )
+
+    before = _count()
+
+    task_id = await make_task(task_type="demo.echo")
+    registry = AdapterRegistry()
+    registry.register("demo.echo", _Echo)
+    worker = Worker(settings=_settings(), registry=registry, capacity=1)
+
+    run = asyncio.ensure_future(worker.run_forever())
+    try:
+        async with asyncio.timeout(8):
+            while True:
+                async with engine.connect() as conn:
+                    state = (
+                        await conn.execute(sa.select(tasks.c.state).where(tasks.c.id == task_id))
+                    ).scalar_one()
+                if state == State.SUCCEEDED:
+                    break
+                await asyncio.sleep(0.02)
+    finally:
+        worker.stop()
+        await asyncio.wait_for(run, timeout=10.0)
+
+    assert _count() > before, (
+        "acp_execution_duration_seconds was not observed -- the timing around "
+        "adapter execution has gone missing"
     )

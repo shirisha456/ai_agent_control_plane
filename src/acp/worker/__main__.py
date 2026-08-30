@@ -8,6 +8,7 @@ import signal
 
 from acp.agent.adapters.base import AdapterRegistry
 from acp.agent.adapters.demo import register_demo_adapters
+from acp.agent.adapters.tool_demo import register_tool_adapters
 from acp.config import settings
 from acp.db.session import dispose_engine
 from acp.obs.exporter import start_exporter
@@ -19,6 +20,7 @@ from acp.worker.loop import Worker
 def build_registry() -> AdapterRegistry:
     registry = AdapterRegistry()
     register_demo_adapters(registry)
+    register_tool_adapters(registry)
     return registry
 
 

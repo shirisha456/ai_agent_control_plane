@@ -105,6 +105,24 @@ stale_writes_rejected = Counter(
     registry=REGISTRY,
 )
 
+tool_calls = Counter(
+    "acp_tool_calls_total",
+    "Tool invocations by authorization decision.",
+    ["tool", "decision"],
+    registry=REGISTRY,
+)
+
+tool_access_denied = Counter(
+    "acp_tool_access_denied_total",
+    (
+        "Tool calls refused by policy. The governance counterpart to "
+        "stale_writes_rejected: a non-zero rate is the proof that "
+        "authorization is actually enforced at runtime."
+    ),
+    ["reason"],
+    registry=REGISTRY,
+)
+
 lease_expirations = Counter(
     "acp_lease_expirations_total",
     "Leases found expired by the reaper.",

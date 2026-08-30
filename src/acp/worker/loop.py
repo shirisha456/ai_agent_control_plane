@@ -18,8 +18,10 @@ import uuid
 from collections.abc import Mapping
 from typing import Any
 
+from acp.agent import tools as tool_runtime
 from acp.agent.adapters.base import Adapter, AdapterRegistry, UnknownTaskType
 from acp.config import Settings
+from acp.db.queries.audit import record_audit_independently
 from acp.db.queries.claim import claim_tasks
 from acp.db.queries.completion import (
     complete_abandoned,
@@ -29,9 +31,12 @@ from acp.db.queries.completion import (
     complete_success,
 )
 from acp.db.queries.lease import renew_lease
+from acp.db.queries.tools import snapshot_policies
 from acp.db.queries.transitions import record_event
 from acp.db.queries.workers import heartbeat, register_worker, set_worker_status
+from acp.db.session import engine as db_engine
 from acp.db.session import transaction
+from acp.domain.authz import UNGOVERNED, AuthzDecision, ToolPolicy, ToolRef
 from acp.domain.errors import FailureClass, classify, retry_after_of
 from acp.domain.retry import RetryDecision
 from acp.domain.retry import decide as decide_retry
@@ -58,6 +63,7 @@ class Worker:
         policy: ClaimPolicy = DEFAULT_POLICY,
         worker_id: str | None = None,
         rng: random.Random | None = None,
+        tool_invoker: tool_runtime.ToolInvoker | None = None,
     ) -> None:
         self.settings = settings
         self.registry = registry
@@ -68,6 +74,9 @@ class Worker:
         #: policy takes the RNG as an argument precisely so this is
         #: possible without patching module globals.
         self._rng = rng or random.Random()
+        #: How an ALLOWED tool call is actually performed. Separate from
+        #: authorization so a new tool type cannot change who may call it.
+        self.tool_invoker = tool_invoker or tool_runtime.simulated_invoker
         self._stopping = asyncio.Event()
         self._inflight: set[asyncio.Task[None]] = set()
         self._last_heartbeat_at: float = float("-inf")
@@ -250,6 +259,14 @@ class Worker:
                 lease_ttl_s=self.settings.lease_ttl_s,
                 policy=self.policy,
             )
+            # Freeze each claimed version's tool policy in the SAME
+            # transaction. A small lookup on the handful of rows the claim
+            # returned -- the ordering scan does not pay for it. Doing it here
+            # rather than at tool-call time means the policy is consistent for
+            # the whole attempt and the tool path needs no query at all.
+            policies = await snapshot_policies(
+                conn, agent_version_ids=[r["agent_version_id"] for r in claimed]
+            )
         metrics.claim_duration.observe(time.monotonic() - started)
         metrics.claim_batch.observe(len(claimed))
 
@@ -261,9 +278,14 @@ class Worker:
             # the latency histogram.
             wait_s = (row["updated_at"] - row["available_at"]).total_seconds()
             metrics.queue_wait.labels(task_type=row["task_type"]).observe(max(0.0, wait_s))
-            self._inflight.add(asyncio.ensure_future(self._run_attempt(row)))
+            # UNGOVERNED for a directly-submitted task: with no agent version
+            # pinned there is no definition on which anything could have been
+            # granted, so it may call nothing. "No policy" must never mean
+            # "everything permitted".
+            policy = policies.get(row["agent_version_id"], UNGOVERNED)
+            self._inflight.add(asyncio.ensure_future(self._run_attempt(row, policy)))
 
-    async def _run_attempt(self, row: Mapping[str, Any]) -> None:
+    async def _run_attempt(self, row: Mapping[str, Any], policy: ToolPolicy = UNGOVERNED) -> None:
         task_id = row["id"]
         attempt = row["attempt"]
         task_type = row["task_type"]
@@ -274,14 +296,29 @@ class Worker:
         renewal = asyncio.ensure_future(
             self._renew_until_stopped(task_id, attempt, cancelled, stop_renewal)
         )
+        started = time.monotonic()
+        # Bound for the duration of this attempt only. asyncio copies the
+        # current context when a Task is created, so concurrent attempts on
+        # one worker cannot observe each other's policy -- and an adapter that
+        # never calls a tool is completely unaffected.
+        token = tool_runtime.bind(self._tool_access(row, policy))
         try:
             adapter = self.registry.get(task_type)
             outcome, detail = await self._execute(adapter, row, cancelled)
         except UnknownTaskType as exc:
             outcome, detail = "failed", exc
         finally:
+            # Unbound before finalisation: nothing after the adapter returns
+            # has any business calling a tool, and leaving it bound would let a
+            # refactor smuggle a tool call into the completion path, where the
+            # policy snapshot is no longer the right authority.
+            tool_runtime.unbind(token)
             stop_renewal.set()
             await renewal
+
+        metrics.execution_duration.labels(task_type=task_type, outcome=outcome).observe(
+            time.monotonic() - started
+        )
 
         try:
             await self._finalize(
@@ -299,6 +336,87 @@ class Worker:
             # back. Leaving it in _owned would make drain try to abandon a
             # task another worker now owns -- fenced out, but noisy.
             self._owned.pop(task_id, None)
+
+    def _tool_access(self, row: Mapping[str, Any], policy: ToolPolicy) -> tool_runtime.ToolAccess:
+        task_id = row["id"]
+        attempt = row["attempt"]
+        tenant_id = row["tenant_id"]
+
+        async def on_decision(tool_name: str, decision: AuthzDecision) -> None:
+            if decision.allowed:
+                # ALLOW is execution history: high volume, only interesting
+                # while debugging this task, so it lives with the task and is
+                # pruned with it.
+                metrics.tool_calls.labels(tool=tool_name, decision="allowed").inc()
+                async with transaction() as conn:
+                    await record_event(
+                        conn,
+                        task_id,
+                        EventType.TOOL_ACCESS_ALLOWED,
+                        attempt=attempt,
+                        worker_id=self.worker_id,
+                        data={"tool": tool_name},
+                    )
+                return
+
+            reason = decision.reason.value if decision.reason else "denied"
+            metrics.tool_calls.labels(tool=tool_name, decision="denied").inc()
+            metrics.tool_access_denied.labels(reason=reason).inc()
+            logger.warning(
+                "worker.tool_access_denied",
+                task_id=str(task_id),
+                attempt=attempt,
+                tool=tool_name,
+                reason=reason,
+                agent_version_id=str(policy.agent_version_id),
+            )
+            # DENY goes to BOTH. The task timeline explains what the task did;
+            # the audit log outlives the task's retention, because a refusal is
+            # what someone comes looking for months later. Denials are rare by
+            # construction, so the duplication costs nothing.
+            async with transaction() as conn:
+                await record_event(
+                    conn,
+                    task_id,
+                    EventType.TOOL_ACCESS_DENIED,
+                    attempt=attempt,
+                    worker_id=self.worker_id,
+                    data={"tool": tool_name, "reason": reason},
+                )
+            # Its OWN transaction, committed immediately. If this shared the
+            # attempt's transaction and the worker then lost its lease, the
+            # completion CAS would fail, everything would roll back, and the
+            # record of the refusal would vanish -- precisely when it matters
+            # most. Security records are never coupled to work that can be
+            # rolled back.
+            await record_audit_independently(
+                db_engine(),
+                tenant_id=tenant_id,
+                action="TOOL_ACCESS_DENIED",
+                resource_type="task",
+                resource_id=task_id,
+                outcome="DENIED",
+                actor=f"agent_version:{policy.agent_version_id}",
+                data={"tool": tool_name, "reason": reason, "attempt": attempt},
+            )
+
+        async def on_executed(tool: ToolRef, ok: bool, error: str | None) -> None:
+            async with transaction() as conn:
+                await record_event(
+                    conn,
+                    task_id,
+                    EventType.TOOL_EXECUTED if ok else EventType.TOOL_EXECUTION_FAILED,
+                    attempt=attempt,
+                    worker_id=self.worker_id,
+                    data={"tool": tool.name, "error": error},
+                )
+
+        return tool_runtime.ToolAccess(
+            policy=policy,
+            invoker=self.tool_invoker,
+            on_decision=on_decision,
+            on_executed=on_executed,
+        )
 
     async def _execute(
         self, adapter: Adapter, row: Mapping[str, Any], cancelled: asyncio.Event
