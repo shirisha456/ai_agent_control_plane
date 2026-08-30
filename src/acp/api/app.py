@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from acp.api.errors import install_error_handlers
-from acp.api.routes import health, metrics, tasks, tenants
+from acp.api.routes import agents, health, metrics, tasks, tenants
 from acp.config import settings
 from acp.db.session import dispose_engine, engine
 from acp.obs.gauges import run_refresher
@@ -52,6 +52,8 @@ install_error_handlers(app)
 app.include_router(health.router)
 app.include_router(metrics.router)
 app.include_router(tenants.router)
+app.include_router(agents.router)
+app.include_router(agents.routes_router)
 app.include_router(tasks.router)
 
 

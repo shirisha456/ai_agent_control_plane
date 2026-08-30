@@ -15,6 +15,18 @@ from acp.scheduling.policy import DEFAULT_POLICY
 pytestmark = pytest.mark.db
 
 
+@pytest.fixture(autouse=True)
+async def _isolated(clean_tasks):
+    """These assert WHICH task the claim returned, so no leftovers.
+
+    The claim query is global by design -- it does not filter by test --
+    so another suite's QUEUED work would be claimed ahead of this one's
+    and the assertions would fail for a reason that has nothing to do
+    with claiming.
+    """
+    yield
+
+
 async def test_claim_grants_lease_and_bumps_attempt(engine, make_task, make_worker) -> None:
     w1 = await make_worker()
     task_id = await make_task()

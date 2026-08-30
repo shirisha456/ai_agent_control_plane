@@ -8,7 +8,7 @@ the submission and query paths around it.
 from __future__ import annotations
 
 import base64
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from acp.db.models import task_events, tasks, tenants
 from acp.db.queries.transitions import record_event, transition
+from acp.domain.agents import capability_key
 from acp.domain.states import TERMINAL, EventType, State
 
 
@@ -44,6 +45,8 @@ async def submit_task(
     priority: int = 100,
     max_attempts: int = 3,
     available_at: datetime | None = None,
+    agent_version_id: UUID | None = None,
+    required_capabilities: Sequence[str] = (),
 ) -> SubmitResult:
     """Insert a task, deduplicating on (tenant_id, idempotency_key).
 
@@ -66,6 +69,16 @@ async def submit_task(
         "priority": priority,
         "max_attempts": max_attempts,
         "state": State.QUEUED.value,
+        # PINNED at submit, never re-resolved. A task that sat in the queue
+        # for an hour still runs the version that was current when it was
+        # accepted -- which is what makes "what executed task 123?" answerable
+        # and keeps a retry from running different code than its first attempt.
+        "agent_version_id": agent_version_id,
+        # Copied from the (immutable) version rather than joined at claim
+        # time. Safe because the source cannot drift; valuable because it
+        # keeps the hottest query in the system free of registry joins.
+        "required_capabilities": list(required_capabilities),
+        "capability_key": capability_key(required_capabilities),
     }
     if available_at is not None:
         values["available_at"] = available_at
@@ -310,3 +323,70 @@ async def get_tenant(conn: AsyncConnection, tenant_id: UUID) -> Mapping[str, Any
         .first()
     )
     return dict(row) if row else None
+
+
+async def cancel_agent_tasks(
+    conn: AsyncConnection, *, agent_version_ids: Sequence[UUID], reason: str
+) -> int:
+    """Stop an agent's live work by requesting cancellation on it.
+
+    Reuses the cancellation mechanism instead of teaching the claim query to
+    check agent status. The tempting design -- `AND agents.status = 'ACTIVE'`
+    in the claim predicate -- puts a join against the registry on the hottest
+    query in the system to serve an admin action that happens once a month.
+
+    QUEUED tasks are cancelled outright. RUNNING tasks get the flag and stop
+    at their worker's next lease renewal; if that worker is already dead, the
+    reaper honours the flag when the lease expires. So this works against a
+    crashed owner too, for free, because cancellation already had to.
+    """
+    if not agent_version_ids:
+        return 0
+
+    queued = await conn.execute(
+        sa.update(tasks)
+        .where(
+            tasks.c.agent_version_id.in_(agent_version_ids),
+            tasks.c.state == State.QUEUED.value,
+        )
+        .values(
+            state=State.CANCELLED.value,
+            cancel_requested=True,
+            finished_at=sa.func.now(),
+            updated_at=sa.func.now(),
+            error_class="AgentDisabled",
+            error_message=reason,
+        )
+        .returning(tasks.c.id, tasks.c.attempt)
+    )
+    queued_rows = queued.mappings().all()
+
+    running = await conn.execute(
+        sa.update(tasks)
+        .where(
+            tasks.c.agent_version_id.in_(agent_version_ids),
+            tasks.c.state == State.RUNNING.value,
+            tasks.c.cancel_requested.is_(False),
+        )
+        .values(cancel_requested=True, updated_at=sa.func.now())
+        .returning(tasks.c.id, tasks.c.attempt)
+    )
+    running_rows = running.mappings().all()
+
+    for row in queued_rows:
+        await record_event(
+            conn,
+            row["id"],
+            EventType.TASK_CANCELLED,
+            attempt=row["attempt"],
+            data={"reason": reason},
+        )
+    for row in running_rows:
+        await record_event(
+            conn,
+            row["id"],
+            EventType.CANCEL_REQUESTED,
+            attempt=row["attempt"],
+            data={"reason": reason, "source": "agent_disabled"},
+        )
+    return len(queued_rows) + len(running_rows)

@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from acp.api.deps import db_read, db_txn
 from acp.api.errors import Conflict, NotFound
 from acp.api.schemas import CancelOut, TaskCreate, TaskEventOut, TaskListOut, TaskOut
+from acp.db.queries import agents as aq
 from acp.db.queries import tasks as q
 from acp.domain.states import State
 from acp.obs import metrics
@@ -53,16 +54,41 @@ async def submit(body: TaskCreate, response: Response, conn: Txn) -> TaskOut:
     if await q.get_tenant(conn, body.tenant_id) is None:
         raise NotFound("unknown tenant", tenant_id=str(body.tenant_id))
 
+    # Resolution runs in the SAME transaction as the insert below. That is
+    # what closes the race where a version is deprecated between "which
+    # version should this use?" and "create the task": both statements read
+    # one snapshot, so a task can never be pinned to a version that was
+    # already withdrawn when it was accepted.
+    resolution = None
+    task_type = body.task_type
+    max_attempts = body.max_attempts
+    if body.request_type is not None:
+        try:
+            resolution = await aq.resolve_route(
+                conn, tenant_id=body.tenant_id, request_type=body.request_type
+            )
+        except aq.NoRoute as exc:
+            raise NotFound(str(exc), request_type=body.request_type) from exc
+        except aq.NotRoutable as exc:
+            raise Conflict(str(exc), request_type=body.request_type) from exc
+        task_type = resolution.runtime_spec.get("task_type", resolution.agent_name)
+        # The version's retry budget wins over the request's: execution policy
+        # travels with the immutable definition, so rolling a version back
+        # rolls its limits back too.
+        max_attempts = resolution.max_attempts
+
     try:
         result = await q.submit_task(
             conn,
             tenant_id=body.tenant_id,
-            task_type=body.task_type,
+            task_type=task_type,
             payload=body.payload,
             idempotency_key=body.idempotency_key,
             priority=body.priority,
-            max_attempts=body.max_attempts,
+            max_attempts=max_attempts,
             available_at=body.available_at,
+            agent_version_id=resolution.version_id if resolution else None,
+            required_capabilities=resolution.required_capabilities if resolution else (),
         )
     except q.PayloadMismatch as exc:
         raise Conflict(
@@ -77,7 +103,7 @@ async def submit(body: TaskCreate, response: Response, conn: Txn) -> TaskOut:
     # (how hard are clients retrying?), and a ratio is easier to read off one
     # metric than off two.
     metrics.tasks_submitted.labels(
-        task_type=body.task_type, deduplicated=str(not result.created).lower()
+        task_type=task_type, deduplicated=str(not result.created).lower()
     ).inc()
 
     if not result.created:

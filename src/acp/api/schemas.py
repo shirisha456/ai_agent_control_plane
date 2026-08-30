@@ -12,7 +12,7 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 # Task payloads are PARAMETERS AND REFERENCES, not blobs. `tasks` is the
 # hottest table in the system: every claim, renewal and completion rewrites a
@@ -37,8 +37,27 @@ class TenantOut(BaseModel):
 
 
 class TaskCreate(BaseModel):
+    """A submission, in one of two modes.
+
+    DIRECT      task_type + payload. The primitive: the worker looks the type
+                up in its adapter registry and runs it. No governance, no
+                pinning, no record of which definition ran.
+
+    AGENT-ROUTED
+                request_type + payload. The control plane resolves
+                request_type -> agent -> its released version, and PINS that
+                version onto the task. This is what makes execution
+                reproducible and what a tool-authorization decision will later
+                hang off.
+
+    Exactly one of the two must be given. Accepting both would leave the
+    resolved agent and the declared task_type free to disagree, and nothing
+    could say which one actually ran.
+    """
+
     tenant_id: UUID
-    task_type: str = Field(min_length=1, max_length=128)
+    task_type: str | None = Field(default=None, min_length=1, max_length=128)
+    request_type: str | None = Field(default=None, min_length=1, max_length=128)
     payload: dict[str, Any] = Field(default_factory=dict)
 
     # Optional. When present, submission is idempotent within the tenant.
@@ -52,6 +71,12 @@ class TaskCreate(BaseModel):
     # Delayed submission. Shares the `available_at` column with retry backoff,
     # because "not runnable until T" is one concept, not two.
     available_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def _exactly_one_submission_mode(self) -> TaskCreate:
+        if bool(self.task_type) == bool(self.request_type):
+            raise ValueError("provide exactly one of task_type or request_type")
+        return self
 
     @field_validator("payload")
     @classmethod
@@ -69,6 +94,10 @@ class TaskOut(BaseModel):
     id: UUID
     tenant_id: UUID
     task_type: str
+    #: Set only for agent-routed submissions. NULL means "submitted directly",
+    #: which is information rather than a missing value.
+    agent_version_id: UUID | None = None
+    required_capabilities: list[str] = Field(default_factory=list)
     payload: dict[str, Any]
     idempotency_key: str | None
     priority: int

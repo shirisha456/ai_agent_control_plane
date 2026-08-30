@@ -24,6 +24,10 @@ task_state = pg.ENUM(
     create_type=False,
 )
 worker_status = pg.ENUM("ALIVE", "DRAINING", "DEAD", name="worker_status", create_type=False)
+agent_status = pg.ENUM("ACTIVE", "DEPRECATED", "DISABLED", name="agent_status", create_type=False)
+version_status = pg.ENUM(
+    "DRAFT", "ACTIVE", "DEPRECATED", "DISABLED", name="version_status", create_type=False
+)
 attempt_outcome = pg.ENUM(
     "SUCCEEDED",
     "FAILED",
@@ -95,6 +99,18 @@ tasks = sa.Table(
     # adding a constraint check to the single hottest write in the system.
     sa.Column("lease_worker_id", sa.Text),
     sa.Column("lease_expires_at", TS),
+    # Pinned at submit from an immutable agent version, or left empty for a
+    # direct task_type submission. Copied rather than joined so the claim
+    # query never touches the registry -- safe precisely because the source
+    # cannot change (migration 0006 enforces that with a trigger).
+    sa.Column("agent_version_id", pg.UUID(as_uuid=True)),
+    sa.Column(
+        "required_capabilities",
+        pg.ARRAY(sa.Text),
+        nullable=False,
+        server_default=sa.text("'{}'::text[]"),
+    ),
+    sa.Column("capability_key", sa.Text, nullable=False, server_default=""),
     sa.Column("cancel_requested", sa.Boolean, nullable=False, server_default=sa.text("false")),
     sa.Column("result", pg.JSONB),
     sa.Column("error_class", sa.Text),
@@ -173,4 +189,63 @@ task_attempts = sa.Table(
     sa.Column("error_message", sa.Text),
     # (task_id, attempt) is a duplicate-execution guard, not merely a key.
     sa.PrimaryKeyConstraint("task_id", "attempt", name="pk_task_attempts"),
+)
+
+
+agents = sa.Table(
+    "agents",
+    metadata,
+    sa.Column(
+        "id", pg.UUID(as_uuid=True), primary_key=True, server_default=sa.text("gen_random_uuid()")
+    ),
+    sa.Column("tenant_id", pg.UUID(as_uuid=True), sa.ForeignKey("tenants.id"), nullable=False),
+    sa.Column("name", sa.Text, nullable=False),
+    sa.Column("description", sa.Text),
+    sa.Column("status", agent_status, nullable=False, server_default="ACTIVE"),
+    sa.Column("default_version_id", pg.UUID(as_uuid=True)),
+    sa.Column("created_at", TS, nullable=False, server_default=sa.text("now()")),
+    sa.Column("updated_at", TS, nullable=False, server_default=sa.text("now()")),
+    sa.UniqueConstraint("tenant_id", "name", name="uq_agents_tenant_name"),
+)
+
+
+agent_versions = sa.Table(
+    "agent_versions",
+    metadata,
+    sa.Column(
+        "id", pg.UUID(as_uuid=True), primary_key=True, server_default=sa.text("gen_random_uuid()")
+    ),
+    sa.Column("agent_id", pg.UUID(as_uuid=True), sa.ForeignKey("agents.id"), nullable=False),
+    sa.Column("version", sa.Integer, nullable=False),
+    # Everything below except `status` is IMMUTABLE after insert, enforced by
+    # a BEFORE UPDATE trigger in migration 0006.
+    sa.Column("runtime_spec", pg.JSONB, nullable=False, server_default=sa.text("'{}'::jsonb")),
+    sa.Column(
+        "required_capabilities",
+        pg.ARRAY(sa.Text),
+        nullable=False,
+        server_default=sa.text("'{}'::text[]"),
+    ),
+    sa.Column("config", pg.JSONB, nullable=False, server_default=sa.text("'{}'::jsonb")),
+    sa.Column("max_attempts", sa.Integer, nullable=False, server_default="3"),
+    sa.Column("max_execution_time_s", sa.Integer, nullable=False, server_default="300"),
+    sa.Column("status", version_status, nullable=False, server_default="DRAFT"),
+    sa.Column("created_at", TS, nullable=False, server_default=sa.text("now()")),
+    sa.UniqueConstraint("agent_id", "version", name="uq_agent_versions_agent_version"),
+)
+
+
+agent_routes = sa.Table(
+    "agent_routes",
+    metadata,
+    sa.Column(
+        "tenant_id",
+        pg.UUID(as_uuid=True),
+        sa.ForeignKey("tenants.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    sa.Column("request_type", sa.Text, nullable=False),
+    sa.Column("agent_id", pg.UUID(as_uuid=True), sa.ForeignKey("agents.id"), nullable=False),
+    sa.Column("created_at", TS, nullable=False, server_default=sa.text("now()")),
+    sa.PrimaryKeyConstraint("tenant_id", "request_type", name="pk_agent_routes"),
 )
