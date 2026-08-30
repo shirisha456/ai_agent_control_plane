@@ -102,7 +102,12 @@ def test_error_class_normalisation_bounds_the_label() -> None:
     adds a time series -- and one that raises a dynamically-named class adds
     unbounded series.
     """
-    assert metrics.normalize_error_class("Retryable") == "Retryable"
+    # The vocabulary is the FailureClass enum, so every member round-trips
+    # and nothing outside it can.
+    from acp.domain.errors import FailureClass
+
+    for member in FailureClass:
+        assert metrics.normalize_error_class(member.value) == member.value
     assert metrics.normalize_error_class("SomeVendorSpecificError_42") == "other"
     assert metrics.normalize_error_class(None) == "none"
     assert metrics.normalize_error_class("") == "none"

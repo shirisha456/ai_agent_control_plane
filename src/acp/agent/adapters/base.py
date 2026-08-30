@@ -12,14 +12,36 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from typing import Any, Protocol
 
+from acp.domain.errors import (
+    DependencyUnavailable,
+    InvalidInput,
+    PermanentFailure,
+    PermissionDenied,
+    RateLimited,
+    Retryable,
+    UpstreamTimeout,
+)
 
-class Retryable(Exception):
-    """Raised by an adapter for a failure the scheduler should retry.
-
-    Anything else an adapter raises is treated as permanent (see
-    acp.worker.loop): the task fails outright rather than burning attempts on
-    an error that will never succeed.
-    """
+# The exception hierarchy lives in acp.domain.errors, not here: the retry
+# policy has to reason about failure classes, and the domain layer is the
+# lowest one -- an adapter importing from domain is correct layering, whereas
+# domain importing from the agent package would invert it.
+#
+# Re-exported so adapters keep a single obvious import.
+__all__ = [
+    "Adapter",
+    "AdapterFactory",
+    "AdapterRegistry",
+    "CancelledByRequest",
+    "DependencyUnavailable",
+    "InvalidInput",
+    "PermanentFailure",
+    "PermissionDenied",
+    "RateLimited",
+    "Retryable",
+    "UnknownTaskType",
+    "UpstreamTimeout",
+]
 
 
 class CancelledByRequest(Exception):

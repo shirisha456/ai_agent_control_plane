@@ -11,13 +11,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import random
 import socket
 import time
 import uuid
 from collections.abc import Mapping
 from typing import Any
 
-from acp.agent.adapters.base import Adapter, AdapterRegistry, Retryable, UnknownTaskType
+from acp.agent.adapters.base import Adapter, AdapterRegistry, UnknownTaskType
 from acp.config import Settings
 from acp.db.queries.claim import claim_tasks
 from acp.db.queries.completion import (
@@ -31,6 +32,9 @@ from acp.db.queries.lease import renew_lease
 from acp.db.queries.transitions import record_event
 from acp.db.queries.workers import heartbeat, register_worker, set_worker_status
 from acp.db.session import transaction
+from acp.domain.errors import FailureClass, classify, retry_after_of
+from acp.domain.retry import RetryDecision
+from acp.domain.retry import decide as decide_retry
 from acp.domain.states import EventType
 from acp.obs import metrics
 from acp.obs.logging import get_logger
@@ -44,18 +48,6 @@ def new_worker_id() -> str:
     return f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
 
-def _retry_backoff_s(attempt: int) -> float:
-    """Full-jitter exponential backoff, capped at 60s.
-
-    Attempt is the fencing token, already incremented at claim time, so
-    attempt=1 is the first try -- backoff only grows from the second attempt.
-    """
-    import random
-
-    base = min(60.0, 2.0 ** max(0, attempt - 1))
-    return random.uniform(0, base)
-
-
 class Worker:
     def __init__(
         self,
@@ -65,12 +57,17 @@ class Worker:
         capacity: int = 5,
         policy: ClaimPolicy = DEFAULT_POLICY,
         worker_id: str | None = None,
+        rng: random.Random | None = None,
     ) -> None:
         self.settings = settings
         self.registry = registry
         self.capacity = capacity
         self.policy = policy
         self.worker_id = worker_id or new_worker_id()
+        #: Injectable so tests can assert an exact backoff schedule. The
+        #: policy takes the RNG as an argument precisely so this is
+        #: possible without patching module globals.
+        self._rng = rng or random.Random()
         self._stopping = asyncio.Event()
         self._inflight: set[asyncio.Task[None]] = set()
         self._last_heartbeat_at: float = float("-inf")
@@ -178,10 +175,9 @@ class Worker:
         self,
         task_type: str,
         outcome: str,
-        detail: Any,
+        failure_class: FailureClass,
         cancel_requested: bool,
-        attempt: int,
-        max_attempts: int,
+        decision: RetryDecision | None,
     ) -> None:
         """Count what actually happened, mirroring _finalize's branches.
 
@@ -190,22 +186,19 @@ class Worker:
         actually did -- the metric would say the task succeeded here when it
         succeeded somewhere else.
         """
-        error_class = metrics.normalize_error_class(
-            type(detail).__name__ if isinstance(detail, Exception) else None
-        )
         if cancel_requested:
-            attempt_outcome, task_state = "CANCELLED", "CANCELLED"
+            attempt_outcome = task_state = "CANCELLED"
         elif outcome == "succeeded":
-            attempt_outcome, task_state = "SUCCEEDED", "SUCCEEDED"
-        elif outcome == "retryable" and attempt < max_attempts:
-            metrics.tasks_retried.labels(task_type=task_type, error_class=error_class).inc()
-            # The attempt finished; the TASK has not reached a terminal state,
-            # so it is deliberately absent from tasks_terminal_total. Conflating
-            # the two would make "tasks completed" count retries.
+            attempt_outcome = task_state = "SUCCEEDED"
+        elif decision is not None and decision.should_retry:
+            metrics.tasks_retried.labels(task_type=task_type, error_class=failure_class.value).inc()
+            # The ATTEMPT finished; the TASK has not reached a terminal state,
+            # so it is deliberately absent from tasks_terminal_total.
+            # Conflating the two would make "tasks completed" count retries.
             metrics.task_attempts_finished.labels(task_type=task_type, outcome="FAILED").inc()
             return
         else:
-            attempt_outcome, task_state = "FAILED", "FAILED"
+            attempt_outcome = task_state = "FAILED"
 
         metrics.task_attempts_finished.labels(task_type=task_type, outcome=attempt_outcome).inc()
         metrics.tasks_terminal.labels(task_type=task_type, state=task_state).inc()
@@ -312,9 +305,11 @@ class Worker:
     ) -> tuple[str, Any]:
         try:
             result = await adapter.run(row["payload"], is_cancelled=cancelled.is_set)
-        except Retryable as exc:
-            return "retryable", exc
         except Exception as exc:  # noqa: BLE001 - adapter errors are data, not our bug
+            # One except clause, because the decision is no longer "was this
+            # the retryable exception type" but "what class of failure is
+            # this" -- which acp.domain.errors answers for typed adapter
+            # errors and well-known builtins alike.
             return "failed", exc
         return "succeeded", result
 
@@ -353,33 +348,62 @@ class Worker:
         cancel_requested: bool,
         task_type: str = "unknown",
     ) -> None:
+        failure_class = FailureClass.UNKNOWN
+        decision = None
+        if outcome != "succeeded":
+            failure_class = (
+                classify(detail) if isinstance(detail, BaseException) else FailureClass.UNKNOWN
+            )
+            decision = decide_retry(
+                failure_class,
+                attempt=attempt,
+                max_attempts=max_attempts,
+                retry_after_s=(
+                    retry_after_of(detail) if isinstance(detail, BaseException) else None
+                ),
+                rng=self._rng,
+            )
+
+        # `error_class` stores the FAILURE CLASS, not the Python exception
+        # type. It is a Prometheus label, a query filter and a dashboard
+        # dimension, and all three want a bounded vocabulary; an adapter
+        # author must not be able to add a value by naming a new exception.
+        # The exception type is preserved in error_message, where high
+        # cardinality is free.
+        error_class = failure_class.value
+        error_message = (
+            f"{type(detail).__name__}: {detail}"
+            if isinstance(detail, BaseException)
+            else str(detail)
+        )
+
         async with transaction() as conn:
-            if outcome == "succeeded":
-                if cancel_requested:
-                    res = await complete_cancelled(
-                        conn, task_id, attempt=attempt, worker_id=self.worker_id
-                    )
-                else:
-                    res = await complete_success(
-                        conn,
-                        task_id,
-                        attempt=attempt,
-                        worker_id=self.worker_id,
-                        result=dict(detail),
-                    )
-            elif outcome == "retryable" and not cancel_requested and attempt < max_attempts:
+            if cancel_requested:
+                # Checked first: a task told to stop is cancelled, whatever its
+                # adapter happened to return on the way out. Ordering this
+                # after the success branch would let a task that finished
+                # microseconds before the cancel land as SUCCEEDED, and the
+                # caller who asked for cancellation would never learn why.
+                res = await complete_cancelled(
+                    conn, task_id, attempt=attempt, worker_id=self.worker_id
+                )
+            elif outcome == "succeeded":
+                res = await complete_success(
+                    conn,
+                    task_id,
+                    attempt=attempt,
+                    worker_id=self.worker_id,
+                    result=dict(detail),
+                )
+            elif decision is not None and decision.should_retry:
                 res = await complete_retry(
                     conn,
                     task_id,
                     attempt=attempt,
                     worker_id=self.worker_id,
-                    error_class=type(detail).__name__,
-                    error_message=str(detail),
-                    backoff_s=_retry_backoff_s(attempt),
-                )
-            elif cancel_requested:
-                res = await complete_cancelled(
-                    conn, task_id, attempt=attempt, worker_id=self.worker_id
+                    error_class=error_class,
+                    error_message=error_message,
+                    backoff_s=decision.backoff_s,
                 )
             else:
                 res = await complete_failed(
@@ -387,13 +411,21 @@ class Worker:
                     task_id,
                     attempt=attempt,
                     worker_id=self.worker_id,
-                    error_class=type(detail).__name__ if isinstance(detail, Exception) else "Error",
-                    error_message=str(detail),
+                    error_class=error_class,
+                    error_message=error_message,
                 )
         if res.applied:
-            self._record_outcome(
-                task_type, outcome, detail, cancel_requested, attempt, max_attempts
-            )
+            self._record_outcome(task_type, outcome, failure_class, cancel_requested, decision)
+            if decision is not None:
+                logger.info(
+                    "worker.attempt_finished",
+                    task_id=str(task_id),
+                    attempt=attempt,
+                    failure_class=error_class,
+                    retrying=decision.should_retry,
+                    backoff_s=round(decision.backoff_s, 3),
+                    reason=decision.reason,
+                )
 
         if not res.applied:
             rejection = res.rejection.value if res.rejection else "unknown"

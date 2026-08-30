@@ -35,6 +35,8 @@ from __future__ import annotations
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram, generate_latest
 from prometheus_client.exposition import CONTENT_TYPE_LATEST
 
+from acp.domain.errors import FailureClass
+
 #: A dedicated registry rather than the global default: the default carries
 #: process/GC collectors we do not want, and re-importing a module that
 #: registers into it raises Duplicated timeseries errors under pytest.
@@ -44,18 +46,10 @@ CONTENT_TYPE = CONTENT_TYPE_LATEST
 
 # Exception class names allowed as label values. Anything else becomes "other"
 # so an adapter cannot mint unbounded series by raising a novel exception.
-KNOWN_ERROR_CLASSES = frozenset(
-    {
-        "Retryable",
-        "UnknownTaskType",
-        "TimeoutError",
-        "CancelledError",
-        "LeaseExpired",
-        "ValueError",
-        "ConnectionError",
-        "Error",
-    }
-)
+# The vocabulary IS the FailureClass enum -- a closed set the domain layer
+# already maintains, rather than a second list here that would silently drift
+# out of sync with it.
+KNOWN_ERROR_CLASSES = frozenset(c.value for c in FailureClass)
 
 
 def normalize_error_class(name: str | None) -> str:

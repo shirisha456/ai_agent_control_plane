@@ -4,7 +4,7 @@ Distributed infrastructure for scheduling and reliably executing AI agent worklo
 
 The project focuses particularly deeply on **execution correctness under concurrency and partial failure** — lease-based ownership, fencing tokens, compare-and-set state transitions, and bounded failure recovery. AI agents are the workload; distributed systems are the project.
 
-> **Status:** phases 0–4 of 11 are implemented (state machine, Control API, worker fleet, reaper-based recovery, observability). Agent registry, tool authorization, capability-aware scheduling, and benchmarks are not built yet. See [Roadmap](#roadmap). Nothing in this README claims a number that has not been measured.
+> **Status:** phases 0–5 of 11 are implemented (state machine, Control API, worker fleet, reaper-based recovery, observability, failure classification and retry). Agent registry, tool authorization, capability-aware scheduling, and benchmarks are not built yet. See [Roadmap](#roadmap). Nothing in this README claims a number that has not been measured.
 
 ---
 
@@ -66,6 +66,8 @@ An agent task runs for seconds to minutes across several external calls — an L
 **Compare-and-set, not locks.** Every state change is a single-statement `UPDATE ... WHERE <predicate>`. Under `READ COMMITTED`, PostgreSQL takes a row lock and re-evaluates the predicate against the latest committed row (EvalPlanQual), so N racing transactions produce exactly one winner. `SERIALIZABLE` would add serialization failures to buy a guarantee we already have.
 
 **`applied=False` is a return value, not an exception.** Losing a CAS is how a worker *learns* its lease expired. Making it throw would grow a `try/except` at every call site that eventually swallows a genuine lost-ownership signal.
+
+**Failure classification drives retry.** "Did it fail?" is not a useful question; "will it succeed if we try again?" is. A 429 backs off harder than a generic blip, a malformed payload never retries at all, and a killed worker retries with *no* backoff — the task never misbehaved, so delaying it punishes the workload for the infrastructure's problem. Backoff uses **full jitter**, because the problem is correlation: a thousand tasks failing in the same second would otherwise retry in the same second, rebuilding the herd against the still-recovering dependency.
 
 **Derived state, not stored state.** There is no `RETRYING` state — a task waiting out backoff is `QUEUED` with a future `available_at`, and the claim predicate excludes it for free. There is no `CANCELLING` state — cancellation is a *request flag*, because you cannot yank work out of a remote process.
 
@@ -181,7 +183,7 @@ Notable metrics: `acp_stale_writes_rejected_total` (the fencing evidence), `acp_
 | 2 — worker registry, `SKIP LOCKED` claim, leases | ✅ |
 | 3 — reaper, recovery, fencing, chaos suite | ✅ |
 | 4 — metrics, structured logs, Prometheus/Grafana | ✅ |
-| 5 — failure classification, richer retry taxonomy | partial |
+| 5 — failure classification, retry policy, backoff | ✅ |
 | 6 — agent registry, immutable agent versions, routing | ⬜ |
 | 7 — tool registry, versioned grants, runtime authorization, audit log | ⬜ |
 | 8 — scheduling policy: fairness + capability-aware placement | ⬜ |

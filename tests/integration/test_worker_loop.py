@@ -7,13 +7,20 @@ import asyncio
 import pytest
 import sqlalchemy as sa
 
-from acp.agent.adapters.base import Adapter, AdapterRegistry, Retryable
+from acp.agent.adapters.base import Adapter, AdapterRegistry
 from acp.config import Settings
 from acp.db.models import tasks
+from acp.domain.errors import AdapterError, FailureClass
 from acp.domain.states import State
 from acp.worker.loop import Worker
 
 pytestmark = pytest.mark.db
+
+
+class _ZeroBackoffFailure(AdapterError):
+    """WORKER_LOST retries with zero backoff, so the test needs no stub."""
+
+    failure_class = FailureClass.WORKER_LOST
 
 
 def _settings(**overrides) -> Settings:
@@ -55,8 +62,15 @@ class _Echo(Adapter):
 
 
 class _AlwaysFail(Adapter):
+    """Fails as WORKER_LOST, whose policy is zero backoff.
+
+    Using a real failure class rather than patching the backoff away keeps
+    the test exercising the actual retry path: the schedule comes from
+    acp.domain.retry, not from a stub.
+    """
+
     async def run(self, payload, *, is_cancelled):
-        raise Retryable("nope")
+        raise _ZeroBackoffFailure("nope")
 
 
 async def test_worker_claims_and_succeeds(engine, make_task, monkeypatch) -> None:
@@ -90,7 +104,6 @@ async def test_worker_retries_then_exhausts_to_failed(engine, make_task, monkeyp
     import acp.worker.loop as loop_mod
 
     monkeypatch.setattr(loop_mod, "transaction", _bind_transaction(engine))
-    monkeypatch.setattr(loop_mod, "_retry_backoff_s", lambda attempt: 0.0)
 
     task_id = await make_task(task_type="demo.fail", max_attempts=2)
     registry = AdapterRegistry()
