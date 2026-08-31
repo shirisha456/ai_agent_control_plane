@@ -50,6 +50,10 @@ services:
     environment:
       ACP_DATABASE_URL: postgresql+psycopg://acp:acp@postgres:5432/acp
       ACP_METRICS_PORT: "9100"
+      # What this machine offers, not what its adapters can execute. Empty by
+      # default so every worker is a generalist; set per-deployment to carve
+      # out specialists (e.g. ACP_WORKER_CAPABILITIES=gpu).
+      ACP_WORKER_CAPABILITIES: "${ACP_WORKER_CAPABILITIES:-}"
     command: ["python", "-m", "acp.worker"]
 
   reaper:

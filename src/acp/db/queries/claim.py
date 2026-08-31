@@ -42,11 +42,12 @@ spent, not read once per row.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 from uuid import UUID
 
 import sqlalchemy as sa
+from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from acp.db.models import task_attempts, task_events, tasks, tenants
@@ -67,6 +68,7 @@ async def claim_tasks(
     limit: int,
     lease_ttl_s: int,
     policy: ClaimPolicy,
+    worker_capabilities: Sequence[str] = (),
 ) -> list[Mapping[str, Any]]:
     """Claim up to `limit` eligible tasks for `worker_id`, granting a lease on each.
 
@@ -86,7 +88,35 @@ async def claim_tasks(
             break
 
         stmt = sa.select(tasks.c.id, tasks.c.tenant_id).where(
-            tasks.c.state == State.QUEUED.value, tasks.c.available_at <= sa.func.now()
+            tasks.c.state == State.QUEUED.value,
+            tasks.c.available_at <= sa.func.now(),
+            # CAPABILITY MATCHING: the task's requirements must be a SUBSET of
+            # what this worker offers (PostgreSQL's `<@` array containment).
+            #
+            # An empty requirement set is contained by everything, so a task
+            # that states no requirements is claimable by any worker -- the
+            # right default, because a task with no stated needs should never
+            # be unschedulable.
+            #
+            # required_capabilities was COPIED onto the task at submit from an
+            # immutable agent version (migration 0006), so this predicate needs
+            # no join against the registry. That is the whole reason pinning is
+            # a performance decision and not only a reproducibility one.
+            #
+            # PLAN NOTE: this is a FILTER applied to rows the ready index
+            # returns in priority order, not part of the index key. It is right
+            # when most tasks are claimable by most workers, which is the
+            # normal case. It degrades when a specialist worker faces a deep
+            # queue of work it cannot run: the scan walks the whole queue in
+            # priority order rejecting nearly everything, so claim latency
+            # becomes O(queue depth) instead of O(batch).
+            # tests/integration/test_capability_scheduling.py measures exactly
+            # that case; `tasks.capability_key` exists (unused today) so the
+            # fix is a keyed partial index rather than another rewrite of a
+            # hot table.
+            tasks.c.required_capabilities.contained_by(
+                sa.cast(sa.literal(list(worker_capabilities)), ARRAY(sa.Text))
+            ),
         )
         if seen_ids:
             stmt = stmt.where(tasks.c.id.notin_(seen_ids))

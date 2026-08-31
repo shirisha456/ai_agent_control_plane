@@ -38,6 +38,17 @@ class Settings(BaseSettings):
     # --- scheduling ------------------------------------------------------
     poll_interval_ms: int = 250
     claim_batch_size: int = 5
+
+    # What this worker process can do, comma-separated -- e.g.
+    # "gpu,internet,large_context". Configuration rather than code,
+    # because capability is a property of the MACHINE (does it have a GPU?
+    # can it reach the internet?), not of the software running on it. Two
+    # identical worker images on different hardware must be able to
+    # advertise differently without a rebuild.
+    #
+    # Empty means a generalist worker, which can still run every task that
+    # requires nothing.
+    worker_capabilities: str = ""
     # How long a stopping worker lets in-flight attempts finish before
     # handing them back. Docker's default SIGTERM->SIGKILL window is 10s,
     # so staying under it keeps graceful shutdown actually graceful.
@@ -50,6 +61,18 @@ class Settings(BaseSettings):
     # can be correct without cross-process coordination.
     metrics_port: int = 0  # 0 disables the standalone exporter
     gauge_refresh_s: float = 5.0
+
+    def capabilities(self) -> tuple[str, ...]:
+        """Normalised the same way the domain normalises requirements.
+
+        Both sides go through the same lowercasing and trimming, so a
+        worker advertising "GPU " satisfies a task requiring "gpu". A
+        mismatch there would be invisible -- the task would simply never be
+        claimed, with no error anywhere.
+        """
+        return tuple(
+            sorted({c.strip().lower() for c in self.worker_capabilities.split(",") if c.strip()})
+        )
 
     def validate_timing(self) -> None:
         """Fail fast on a configuration that guarantees spurious lease loss."""

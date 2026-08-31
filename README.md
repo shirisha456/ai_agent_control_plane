@@ -4,7 +4,7 @@ Distributed infrastructure for scheduling and reliably executing AI agent worklo
 
 The project focuses particularly deeply on **execution correctness under concurrency and partial failure** — lease-based ownership, fencing tokens, compare-and-set state transitions, and bounded failure recovery. AI agents are the workload; distributed systems are the project.
 
-> **Status:** phases 0–7 of 11 are implemented (state machine, Control API, worker fleet, reaper-based recovery, observability, failure classification and retry, agent registry with immutable versions, tool registry with runtime authorization and an audit log). Capability-aware scheduling, admission control, and benchmarks are not built yet. See [Roadmap](#roadmap). Nothing in this README claims a number that has not been measured.
+> **Status:** phases 0–7 of 11 are implemented (state machine, Control API, worker fleet, reaper-based recovery, observability, failure classification and retry, agent registry with immutable versions, tool registry with runtime authorization and an audit log, capability-aware placement). Fair-share scheduling, admission control, and benchmarks are not built yet. See [Roadmap](#roadmap). Nothing in this README claims a number that has not been measured.
 
 ---
 
@@ -74,6 +74,8 @@ An agent task runs for seconds to minutes across several external calls — an L
 **Static grants are versioned; denial is always live.** A tool grant attaches to an immutable agent *version*, so a version is a complete capability bundle and widening an agent's reach needs a reviewable new version rather than an `INSERT`. Because that would be far too slow to *revoke* during an incident, revocation doesn't go through grants at all — `tools.status = DISABLED` denies every use immediately, whatever any grant says. Same shape as certificate revocation: the certificate is immutable, but validity is checked at use.
 
 **Authorization costs nothing at runtime.** The policy is snapshotted inside the *claim* transaction, so a tool call is a dictionary lookup and a set membership test — no query, no cache, no staleness window. An agent therefore can't gain a capability halfway through its own execution, and revocation latency is bounded by attempt duration, which is an explainable SLA rather than a cache TTL.
+
+**Capability matching is a filter, and the cost is measured.** A task's `required_capabilities` must be a subset of its worker's (`<@` array containment). Because requirements are copied from an immutable version at submit, the predicate needs no join against the registry. But it is a *filter* on rows the ready index returns in priority order, not part of the index key — so a specialist worker facing a deep queue of work it cannot run scans that whole queue. `tests/integration/test_capability_scheduling.py` measures it: **~47 ms to claim from a 2,000-row queue**. `tasks.capability_key` already exists, unused, so the fix is a keyed partial index rather than another rewrite of a hot table.
 
 **Derived state, not stored state.** There is no `RETRYING` state — a task waiting out backoff is `QUEUED` with a future `available_at`, and the claim predicate excludes it for free. There is no `CANCELLING` state — cancellation is a *request flag*, because you cannot yank work out of a remote process.
 
@@ -192,7 +194,7 @@ Notable metrics: `acp_stale_writes_rejected_total` (the fencing evidence), `acp_
 | 5 — failure classification, retry policy, backoff | ✅ |
 | 6 — agent registry, immutable agent versions, routing | ✅ |
 | 7 — tool registry, versioned grants, runtime authorization, audit log | ✅ |
-| 8 — scheduling policy: fairness + capability-aware placement | ⬜ |
+| 8 — capability-aware placement | ✅ |
 | 9 — admission control, backpressure, 429 vs 503 | ⬜ |
 | 10 — OpenTelemetry tracing, Grafana dashboards, the two demos | ⬜ |
 | 11 — benchmarks with methodology | ⬜ |

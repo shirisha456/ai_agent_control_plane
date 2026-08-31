@@ -15,7 +15,7 @@ import random
 import socket
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from acp.agent import tools as tool_runtime
@@ -64,6 +64,7 @@ class Worker:
         worker_id: str | None = None,
         rng: random.Random | None = None,
         tool_invoker: tool_runtime.ToolInvoker | None = None,
+        capabilities: Sequence[str] | None = None,
     ) -> None:
         self.settings = settings
         self.registry = registry
@@ -77,6 +78,13 @@ class Worker:
         #: How an ALLOWED tool call is actually performed. Separate from
         #: authorization so a new tool type cannot change who may call it.
         self.tool_invoker = tool_invoker or tool_runtime.simulated_invoker
+        #: Normalised through the same path as task requirements, so a
+        #: worker advertising "GPU " satisfies a task requiring "gpu".
+        self.capabilities = (
+            tuple(sorted({c.strip().lower() for c in capabilities if c.strip()}))
+            if capabilities is not None
+            else settings.capabilities()
+        )
         self._stopping = asyncio.Event()
         self._inflight: set[asyncio.Task[None]] = set()
         self._last_heartbeat_at: float = float("-inf")
@@ -94,7 +102,12 @@ class Worker:
                 hostname=socket.gethostname(),
                 pid=os.getpid(),
                 capacity=self.capacity,
-                capabilities=tuple(self.registry.known_types()),
+                # NOT the adapter registry's task types. Worker capability
+                # is what the MACHINE offers (gpu, internet); task_type is
+                # what the software can execute. Conflating them means a
+                # task requiring a GPU would be 'satisfied' by any worker
+                # that merely knows its task type.
+                capabilities=self.capabilities,
             )
 
     def stop(self) -> None:
@@ -258,6 +271,7 @@ class Worker:
                 limit=min(limit, self.settings.claim_batch_size),
                 lease_ttl_s=self.settings.lease_ttl_s,
                 policy=self.policy,
+                worker_capabilities=self.capabilities,
             )
             # Freeze each claimed version's tool policy in the SAME
             # transaction. A small lookup on the handful of rows the claim
