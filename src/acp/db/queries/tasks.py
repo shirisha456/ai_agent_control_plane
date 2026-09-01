@@ -390,3 +390,24 @@ async def cancel_agent_tasks(
             data={"reason": reason, "source": "agent_disabled"},
         )
     return len(queued_rows) + len(running_rows)
+
+
+async def queued_count_for_tenant(conn: AsyncConnection, tenant_id: UUID) -> int:
+    """How many tasks this tenant has waiting.
+
+    Counts every QUEUED row, including those waiting out a retry backoff --
+    deliberately, unlike queue_depth in claim.py which counts only runnable
+    work. Backpressure is about STORAGE: a tenant whose backlog is entirely
+    deferred retries is still accumulating rows without bound, and admitting
+    more would be admitting to a queue that is already too long.
+
+    Served by idx_tasks_tenant_queued (migration 0008), so this is an
+    index-only scan over the tenant's backlog rather than the table.
+    """
+    return (
+        await conn.execute(
+            sa.select(sa.func.count())
+            .select_from(tasks)
+            .where(tasks.c.tenant_id == tenant_id, tasks.c.state == State.QUEUED.value)
+        )
+    ).scalar_one()

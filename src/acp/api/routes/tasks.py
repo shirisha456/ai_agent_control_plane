@@ -17,12 +17,15 @@ from fastapi import APIRouter, Depends, Query, Response, status
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from acp.api.deps import db_read, db_txn
-from acp.api.errors import Conflict, NotFound
+from acp.api.errors import Conflict, NotFound, Overloaded, QuotaExceeded
 from acp.api.schemas import CancelOut, TaskCreate, TaskEventOut, TaskListOut, TaskOut
+from acp.config import settings
 from acp.db.queries import agents as aq
 from acp.db.queries import tasks as q
 from acp.domain.states import State
 from acp.obs import metrics
+from acp.obs.gauges import cached_global_queued
+from acp.scheduling import admission
 
 router = APIRouter(prefix="/v1/tasks", tags=["tasks"])
 
@@ -51,8 +54,41 @@ async def submit(body: TaskCreate, response: Response, conn: Txn) -> TaskOut:
     The status code is the only signal the caller gets that their retry was
     absorbed rather than duplicated, so it must be accurate.
     """
-    if await q.get_tenant(conn, body.tenant_id) is None:
+    tenant = await q.get_tenant(conn, body.tenant_id)
+    if tenant is None:
         raise NotFound("unknown tenant", tenant_id=str(body.tenant_id))
+
+    # ADMISSION CONTROL. Checked before resolution and insert: there is no
+    # point resolving an agent version for a submission we are about to
+    # refuse, and rejecting first means the reject path never touches the
+    # registry.
+    #
+    # Tenant backlog is counted EXACTLY (idx_tasks_tenant_queued, migration
+    # 0008) because it gates one tenant's own correctness. Global depth is
+    # read from the gauge refresher's CACHE, not counted here -- a coarse,
+    # slow-moving signal, because counting the whole table on every submit
+    # would make the overload check part of the overload.
+    queued = await q.queued_count_for_tenant(conn, body.tenant_id)
+    verdict = admission.decide(
+        tenant_queued=queued,
+        tenant_max_queued=tenant["max_queued_tasks"],
+        global_queued=cached_global_queued(),
+        global_shed_threshold=settings().global_queue_shed_threshold,
+    )
+    metrics.admissions.labels(decision=verdict.decision.value).inc()
+
+    if verdict.decision is admission.Admission.REJECT_TENANT_BACKLOG:
+        # 429: "you, slow down." This tenant's own backlog is at its bound --
+        # true independent of how the rest of the system is doing, and the
+        # more actionable message. A submitter over its own quota should never
+        # be told the SYSTEM is struggling.
+        raise QuotaExceeded(verdict.reason, retry_after_s=verdict.retry_after_s)
+    if verdict.decision is admission.Admission.SHED_OVERLOADED:
+        # 503: "us, we're in trouble." Reserved for tenants who did nothing
+        # wrong -- checked only after the tenant-quota check has already
+        # cleared, which is what keeps this signal trustworthy rather than a
+        # catch-all excuse.
+        raise Overloaded(verdict.reason, retry_after_s=verdict.retry_after_s)
 
     # Resolution runs in the SAME transaction as the insert below. That is
     # what closes the race where a version is deprecated between "which

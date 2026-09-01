@@ -49,6 +49,13 @@ class Settings(BaseSettings):
     # Empty means a generalist worker, which can still run every task that
     # requires nothing.
     worker_capabilities: str = ""
+
+    # --- admission control -----------------------------------------------
+    # Global queue depth at which the API starts shedding with 503. Zero
+    # disables it, which is the right default: shedding should be switched
+    # on with a number someone derived from a measured drain rate, not left
+    # at a guess that fires during a normal burst.
+    global_queue_shed_threshold: int = 0
     # How long a stopping worker lets in-flight attempts finish before
     # handing them back. Docker's default SIGTERM->SIGKILL window is 10s,
     # so staying under it keeps graceful shutdown actually graceful.

@@ -69,6 +69,17 @@ tasks_submitted = Counter(
     registry=REGISTRY,
 )
 
+admissions = Counter(
+    "acp_admissions_total",
+    (
+        "Submission admission decisions. The ratio of reject_tenant_backlog "
+        "to shed_overloaded is the difference between one tenant outrunning "
+        "its own capacity and the system being in trouble."
+    ),
+    ["decision"],
+    registry=REGISTRY,
+)
+
 task_attempts_finished = Counter(
     "acp_task_attempts_finished_total",
     "Execution attempts that reached a terminal outcome.",

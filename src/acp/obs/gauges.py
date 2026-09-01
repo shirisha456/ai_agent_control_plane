@@ -30,6 +30,20 @@ from acp.obs.logging import get_logger
 
 log = get_logger(__name__)
 
+#: Last observed global runnable depth, refreshed on the same timer as the
+#: gauges. Admission reads THIS rather than counting the table per submit.
+#:
+#: Approximate on purpose. Per-tenant backlog is counted exactly because it
+#: gates one tenant's correctness; global depth is a coarse survival signal
+#: for a slow-moving condition, and counting the whole table on every submit
+#: would make the overload check part of the overload.
+_global_queued: int = 0
+
+
+def cached_global_queued() -> int:
+    return _global_queued
+
+
 # Grouped by tenant NAME, not id: a uuid is unreadable on a dashboard, and the
 # name is already unique per tenant.
 _QUEUE_SQL = sa.text("""
@@ -71,6 +85,9 @@ async def refresh_once(engine: AsyncEngine) -> None:
         metrics.tasks_running.labels(tenant=row["tenant"]).set(row["running"])
     for row in worker_rows:
         metrics.workers_by_status.labels(status=row["status"]).set(row["n"])
+
+    global _global_queued
+    _global_queued = sum(row["runnable"] for row in rows)
 
     metrics.tasks_backlogged.set(backlog)
     metrics.leases_expired_pending.set(pending)
