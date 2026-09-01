@@ -14,6 +14,7 @@ from acp.api.deps import db_read, db_txn
 from acp.api.errors import Conflict, NotFound
 from acp.db.queries import agents as aq
 from acp.db.queries import audit as auditq
+from acp.db.queries import tasks as tq
 from acp.db.queries import tools as q
 from acp.domain.agents import VersionStatus
 from acp.domain.authz import ToolStatus, ToolType
@@ -42,6 +43,14 @@ class GrantCreate(BaseModel):
 
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def create_tool(body: ToolCreate, conn: Txn) -> dict:
+    # Checked explicitly rather than left to the FK -- see the identical
+    # reasoning on POST /v1/agents. tools.tenant_id also references
+    # tenants.id, so without this check a bad tenant_id and a duplicate name
+    # raise the same IntegrityError and get reported identically, which is
+    # wrong for the former.
+    if await tq.get_tenant(conn, body.tenant_id) is None:
+        raise NotFound("unknown tenant", tenant_id=str(body.tenant_id))
+
     try:
         return dict(
             await q.create_tool(
@@ -156,6 +165,46 @@ async def list_grants(version_id: UUID, conn: Read) -> list[dict]:
     if await aq.get_version(conn, version_id) is None:
         raise NotFound("unknown agent version", version_id=str(version_id))
     return [dict(g) for g in await q.list_grants(conn, agent_version_id=version_id)]
+
+
+@grants_router.delete("/{version_id}/grants/{tool_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def revoke_grant(version_id: UUID, tool_id: UUID, conn: Txn) -> None:
+    """Remove a tool grant from a version that has not been released yet.
+
+    The counterpart of POST .../grants, with the SAME lifecycle guard: a
+    version is meant to be a complete, immutable capability bundle once
+    ACTIVE, so its grants may only change while it is still DRAFT. Without
+    this endpoint a grant added to a DRAFT version by mistake could be added
+    to but never removed from through the API -- the query layer already
+    supports it (db.queries.tools.revoke_grant), it was simply never wired up.
+    """
+    version = await aq.get_version(conn, version_id)
+    if version is None:
+        raise NotFound("unknown agent version", version_id=str(version_id))
+    if VersionStatus(version["status"]) is VersionStatus.ACTIVE:
+        raise Conflict(
+            "cannot change grants on a released version; cut a new version instead",
+            version_id=str(version_id),
+            status=version["status"],
+        )
+
+    tool = await q.get_tool(conn, tool_id)
+    if tool is None:
+        raise NotFound("unknown tool", tool_id=str(tool_id))
+
+    removed = await q.revoke_grant(conn, agent_version_id=version_id, tool_id=tool_id)
+    if not removed:
+        raise NotFound("grant does not exist", version_id=str(version_id), tool_id=str(tool_id))
+
+    await auditq.record_audit(
+        conn,
+        tenant_id=tool["tenant_id"],
+        action="TOOL_GRANT_REVOKED",
+        resource_type="agent_version",
+        resource_id=version_id,
+        outcome="OK",
+        data={"tool": tool["name"], "tool_id": str(tool_id)},
+    )
 
 
 @audit_router.get("")

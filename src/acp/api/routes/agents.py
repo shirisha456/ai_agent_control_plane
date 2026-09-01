@@ -59,6 +59,16 @@ class RouteCreate(BaseModel):
 
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def create_agent(body: AgentCreate, conn: Txn) -> dict:
+    # Checked explicitly rather than left to the FK: agents.tenant_id
+    # references tenants.id, so a bad tenant_id raises the SAME
+    # IntegrityError as a duplicate name would. Catching only the latter
+    # below and letting a foreign-key violation fall through to it would
+    # report "agent name already exists" for an unknown tenant -- true of
+    # neither the name nor the tenant, and actively misleading. Mirrors the
+    # pattern already used in POST /v1/tasks.
+    if await tq.get_tenant(conn, body.tenant_id) is None:
+        raise NotFound("unknown tenant", tenant_id=str(body.tenant_id))
+
     try:
         return dict(
             await q.create_agent(

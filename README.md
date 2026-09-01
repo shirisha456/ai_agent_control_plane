@@ -8,6 +8,16 @@ The project focuses particularly deeply on **execution correctness under concurr
 
 ---
 
+## About
+
+A portfolio project built to demonstrate backend and distributed-systems engineering — scheduling, concurrency, fault tolerance, and observability — using AI agent execution as the workload, not the point. It is built in phases (see the git history and [Roadmap](#14-roadmap)), each landing with working code, tests, and — where the phase touches a live behavior — a real run against the actual stack rather than a description of one.
+
+**If you only look at three things:** [`src/acp/db/queries/transitions.py`](src/acp/db/queries/transitions.py) for the compare-and-set core everything else is built on; [`tests/chaos/test_stale_worker_race.py`](tests/chaos/test_stale_worker_race.py) for the fencing-token race reproduced deterministically with no sleeps; and [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for measured numbers, including two benchmarking bugs the harness caught in itself and left in the writeup rather than quietly fixing.
+
+Skills this project is meant to speak to: distributed coordination without a consensus library, optimistic concurrency and race-condition reasoning, database-backed queueing, lease/heartbeat failure detection, retry and backoff design, multi-tenant admission control, runtime authorization, and treating a benchmark or demo script's own bugs as findings worth keeping rather than embarrassments to hide.
+
+---
+
 ## 1. The problem
 
 An agent task runs for seconds to minutes across several external calls — an LLM, a database, a third-party API, a tool. That has three consequences an ordinary request/response backend never faces:
