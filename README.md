@@ -30,15 +30,15 @@ This project is a control plane that answers each of those with a specific mecha
 flowchart TB
     client([Client])
 
-    subgraph api[Control API — FastAPI, stateless]
+    subgraph api["Control API — FastAPI, stateless"]
         submit["submit / cancel<br/>idempotent, admission-controlled"]
     end
 
-    subgraph pg[("PostgreSQL — single source of truth, one clock")]
+    subgraph pg["PostgreSQL — single source of truth, one clock"]
         tasks[("tasks (+ lease, attempt)<br/>task_attempts · task_events<br/>agents · agent_versions · tools · grants")]
     end
 
-    subgraph workers[Worker fleet — N independent processes]
+    subgraph workers["Worker fleet — N independent processes"]
         w1["Worker: claim → renew lease →<br/>execute → complete"]
     end
 
