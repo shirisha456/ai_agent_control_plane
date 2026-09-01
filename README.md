@@ -1,138 +1,183 @@
 # AI Agent Control Plane
 
-Distributed infrastructure for scheduling and reliably executing AI agent workloads across a dynamic fleet of worker processes.
+Distributed scheduler and durable execution engine for AI agent workloads — built around lease-based ownership, monotonic fencing tokens, and compare-and-set state transitions, so that worker crashes, retries, and duplicate submissions are handled by construction, not by hope.
 
-The project focuses particularly deeply on **execution correctness under concurrency and partial failure** — lease-based ownership, fencing tokens, compare-and-set state transitions, and bounded failure recovery. AI agents are the workload; distributed systems are the project.
+**AI agents are the workload. Distributed systems is the project.**
 
-> **Status:** all 11 phases are implemented and benchmarked. See [BENCHMARKS.md](docs/BENCHMARKS.md) for methodology and real numbers -- nothing below is estimated.
+`Python · FastAPI · PostgreSQL · SQLAlchemy Core · Docker · Prometheus · Grafana · OpenTelemetry`
 
-A portfolio project built to demonstrate backend and distributed-systems engineering — scheduling, concurrency, fault tolerance, and observability — using AI agent execution as the workload, not the point. It is built in phases (see the git history and [Roadmap](#14-roadmap)), each landing with working code, tests, and — where the phase touches a live behavior — a real run against the actual stack rather than a description of one.
-
-**If you only look at three things:** [`src/acp/db/queries/transitions.py`](src/acp/db/queries/transitions.py) for the compare-and-set core everything else is built on; [`tests/chaos/test_stale_worker_race.py`](tests/chaos/test_stale_worker_race.py) for the fencing-token race reproduced deterministically with no sleeps; and [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for measured numbers, including two benchmarking bugs the harness caught in itself and left in the writeup rather than quietly fixing.
-
-Skills this project is meant to speak to: distributed coordination without a consensus library, optimistic concurrency and race-condition reasoning, database-backed queueing, lease/heartbeat failure detection, retry and backoff design, multi-tenant admission control, runtime authorization, and treating a benchmark or demo script's own bugs as findings worth keeping rather than embarrassments to hide.
+> **Status:** all 11 planned phases implemented. 303 tests passing (unit, integration, concurrency, chaos). Real benchmark numbers in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) — nothing in this document is estimated. See [Recommended Engineering Improvements](#recommended-engineering-improvements) for the gaps left open on purpose.
 
 ---
 
-## 1. The problem
+## The problem
 
-An agent task runs for seconds to minutes across several external calls — an LLM, a database, a third-party API, a tool. That has three consequences an ordinary request/response backend never faces:
+Running one AI agent is easy: call a model, call a tool, return a result. Running agent workloads across a fleet of concurrent workers is not, because:
 
-1. **State outlives the process.** Progress must survive the death of the machine executing it, so task state lives outside the executor.
-2. **Ownership must be revocable without cooperation.** A crashed worker cannot hand its work back. Someone else must take it — safely, without the possibility that the "crashed" worker was merely slow and is still running.
-3. **Capacity is finite and contended.** Submission rate is unrelated to execution rate, and tenants share one fleet.
+- **workers crash** mid-task, holding no record of how far they got
+- **workers stall** without crashing — partitioned, paused, or just slow — and may still be running when you've given up on them
+- **leases expire**, and the task has to go to someone else *without* letting the original worker come back and overwrite the new result
+- **retries** must not blow through a downstream dependency that's already struggling, or duplicate a side effect that already landed
+- **duplicate submissions** (a client retrying a timed-out request) must collapse to one task, not create a second one
+- **many workers compete** for the same queue without a central dispatcher becoming the bottleneck
+- **overload** has to degrade a misbehaving tenant's own throughput, not take the whole system down with it
 
-## 2. Why not just use Celery
+This project is a control plane that answers each of those with a specific mechanism — not a chatbot, not a prompt-orchestration framework, not an LLM API wrapper. The agents in it are deliberately uninteresting (simulated adapters, no external API calls) so that every test and every benchmark measures the scheduler, not somebody else's API latency.
 
-| | Celery / RQ | This |
-|---|---|---|
-| Where task state lives | In the broker; the app can't query it | In PostgreSQL — queryable, joinable, constrained |
-| Ownership model | Broker visibility timeout the app can't observe | Explicit lease + fencing token the app owns |
-| Stale-worker writes | Acks aren't fenced — a revived worker's result can land | Rejected by CAS on `(state, attempt, worker)`, and **counted** |
-| Recovery latency | Emergent, unmeasured | A design parameter: `lease_ttl + reaper_period` |
-| "Why is this task slow?" | Guess | `task_events` timeline + metrics |
+## Architecture
 
-## 3. Architecture
+```mermaid
+flowchart TB
+    client([Client])
 
-```
-                       CLIENT
-                          │ HTTP
-              ┌───────────▼────────────┐
-              │  Control API (FastAPI) │  stateless · replicable · disposable
-              │  idempotent submit     │
-              │  cancel · read models  │
-              └───────────┬────────────┘
-                          │
-   ═══════════════════════▼═══════════════════════════════
-   ║              P O S T G R E S Q L                    ║
-   ║        single source of truth · ONE CLOCK           ║
-   ║  tenants │ tasks(+lease) │ task_attempts │ events   ║
-   ║  idx_tasks_ready   ← the queue (partial index)      ║
-   ║  idx_tasks_lease_expiry ← the reaper's scan         ║
-   ═══▲══════════════▲═══════════════════▲═══════════════
-      │ claim        │ renew / heartbeat │ reap
-      │ SKIP LOCKED  │ CAS(attempt)      │ CAS(expired)
-   ┌──┴───────┐  ┌───┴──────┐        ┌───┴──────┐
-   │ Worker 1 │  │ Worker N │   ...  │  Reaper  │
-   └──┬───────┘  └──────────┘        └──────────┘
-      ▼
-   Agent runtime — adapters (task_type → Adapter)
+    subgraph api[Control API — FastAPI, stateless]
+        submit["submit / cancel<br/>idempotent, admission-controlled"]
+    end
 
-   Prometheus ← /metrics (API: DB gauges; worker/reaper: own counters)
+    subgraph pg[("PostgreSQL — single source of truth, one clock")]
+        tasks[("tasks (+ lease, attempt)<br/>task_attempts · task_events<br/>agents · agent_versions · tools · grants")]
+    end
+
+    subgraph workers[Worker fleet — N independent processes]
+        w1["Worker: claim → renew lease →<br/>execute → complete"]
+    end
+
+    reaper["Reaper — singleton sweep<br/>expire leases · mark dead workers"]
+
+    obs[("Prometheus + Grafana<br/>OpenTelemetry traces")]
+
+    client -- HTTP --> submit
+    submit -- "INSERT (CAS-guarded)" --> tasks
+    w1 -- "SKIP LOCKED claim<br/>CAS lease renewal<br/>CAS completion" --> tasks
+    reaper -- "CAS: expired lease → requeue" --> tasks
+    api -. metrics/traces .-> obs
+    workers -. metrics/traces .-> obs
+    reaper -. metrics/traces .-> obs
 ```
 
-**Three deployables, not ten.** API, worker, reaper — the boundary is drawn where failure domains actually differ. Everything inside them shares a PostgreSQL transaction, and splitting transactional code across a network turns one ACID commit into a saga.
+**Three deployables, not ten.** API, worker, reaper — split where failure domains actually differ. Everything inside them shares a single PostgreSQL transaction; splitting transactional code across a network turns one ACID commit into a distributed saga for no benefit at this scale.
 
-## 4. Distributed systems concepts
+## Core engineering mechanisms
 
-**Leases with fencing tokens.** A worker owns a task only until `lease_expires_at`. `tasks.attempt` is a monotonic fencing token allocated by the *same* `UPDATE` that grants the lease, so ownership and token can never disagree. Every ownership-scoped write presents it.
+Every mechanism below exists to prevent a specific failure — not as a generic claim of "fault tolerance."
 
-**One clock.** `lease_expires_at` is computed by PostgreSQL and compared by PostgreSQL. Workers never compare a local clock against a lease deadline for correctness — only to decide when to renew. This deletes the entire clock-skew failure class: a worker with a wrong clock renews early or late, never wrongly believes it still owns a task.
-
-**Compare-and-set, not locks.** Every state change is a single-statement `UPDATE ... WHERE <predicate>`. Under `READ COMMITTED`, PostgreSQL takes a row lock and re-evaluates the predicate against the latest committed row (EvalPlanQual), so N racing transactions produce exactly one winner. `SERIALIZABLE` would add serialization failures to buy a guarantee we already have.
-
-**`applied=False` is a return value, not an exception.** Losing a CAS is how a worker *learns* its lease expired. Making it throw would grow a `try/except` at every call site that eventually swallows a genuine lost-ownership signal.
-
-**Failure classification drives retry.** "Did it fail?" is not a useful question; "will it succeed if we try again?" is. A 429 backs off harder than a generic blip, a malformed payload never retries at all, and a killed worker retries with *no* backoff — the task never misbehaved, so delaying it punishes the workload for the infrastructure's problem. Backoff uses **full jitter**, because the problem is correlation: a thousand tasks failing in the same second would otherwise retry in the same second, rebuilding the herd against the still-recovering dependency.
-
-**Immutable agent versions, pinned at submit.** A task resolves `request_type → agent → released version` once, at submission, and stores the version id. That makes execution reproducible (a retry runs the same code as attempt 1) — but it is also a *performance* decision: because versions cannot change, their fields are copied onto the task row and the claim query never joins the registry. Denormalisation is only dangerous when the source can drift. Immutability is enforced by a database trigger; only `status` may change.
-
-**Static grants are versioned; denial is always live.** A tool grant attaches to an immutable agent *version*, so a version is a complete capability bundle and widening an agent's reach needs a reviewable new version rather than an `INSERT`. Because that would be far too slow to *revoke* during an incident, revocation doesn't go through grants at all — `tools.status = DISABLED` denies every use immediately, whatever any grant says. Same shape as certificate revocation: the certificate is immutable, but validity is checked at use.
-
-**Authorization costs nothing at runtime.** The policy is snapshotted inside the *claim* transaction, so a tool call is a dictionary lookup and a set membership test — no query, no cache, no staleness window. An agent therefore can't gain a capability halfway through its own execution, and revocation latency is bounded by attempt duration, which is an explainable SLA rather than a cache TTL.
-
-**Capability matching is a filter, and the cost is measured.** A task's `required_capabilities` must be a subset of its worker's (`<@` array containment). Because requirements are copied from an immutable version at submit, the predicate needs no join against the registry. But it is a *filter* on rows the ready index returns in priority order, not part of the index key — so a specialist worker facing a deep queue of work it cannot run scans that whole queue. `tests/integration/test_capability_scheduling.py` measures it: **~47 ms to claim from a 2,000-row queue**. `tasks.capability_key` already exists, unused, so the fix is a keyed partial index rather than another rewrite of a hot table.
-
-**429 means "you"; 503 means "us."** Tenant backlog is checked first and rejects with 429, regardless of how the rest of the system is doing — a tenant over its own quota must never be told the system is struggling. Global overload is checked only once that clears, and sheds with 503, which is what keeps it a trustworthy signal rather than a catch-all excuse. The per-tenant count is exact (an indexed query); the global count is a cached, deliberately approximate gauge, because counting the whole table on every submit would make the overload check part of the overload.
-
-**Derived state, not stored state.** There is no `RETRYING` state — a task waiting out backoff is `QUEUED` with a future `available_at`, and the claim predicate excludes it for free. There is no `CANCELLING` state — cancellation is a *request flag*, because you cannot yank work out of a remote process.
-
-## 5. Guarantees
-
-| Property | Value |
+| Mechanism | What it prevents |
 |---|---|
-| Delivery | **At-least-once.** A task may be handed to workers more than once. |
-| Committed outcome | **At-most-once.** At most one attempt ever writes a terminal state. |
-| Side effects | **At-least-once.** Only as strong as the downstream API's idempotency. |
-| Duplicate behaviour | Two attempts can run concurrently during a partition. The stale one is rejected and counted. |
-| Failure behaviour | No task is lost. Crash recovery bounded by `lease_ttl + reaper_period`; graceful shutdown recovers in ~0s. |
+| **Compare-and-set state transitions** — every write is `UPDATE … WHERE state=? AND attempt=? AND lease_worker_id=?` | Two workers, or a worker and the reaper, ever agreeing on which one owns a task |
+| **Monotonic fencing token** (`tasks.attempt`), allocated by the *same* `UPDATE` that grants the lease | A worker that lost its lease from writing a result after someone else has already taken over |
+| **One clock** — `lease_expires_at` computed and compared only by PostgreSQL, never a worker's local clock | A worker with clock skew believing it still owns an expired lease |
+| **`SKIP LOCKED` claiming** over a partial index (`idx_tasks_ready`) | A central dispatcher becoming a bottleneck; N workers claim disjoint rows without blocking each other |
+| **Full-jitter exponential backoff**, chosen per failure class (rate-limited vs. timeout vs. permanent) | A thundering herd of retries hitting a dependency at the exact moment it's recovering |
+| **Idempotent submission** via a partial unique index on `(tenant_id, idempotency_key)` | A client's retried request creating a second task |
+| **Per-tenant admission control**, checked before global overload | A tenant over its own quota being told "the system is struggling" when the honest answer is "you are" |
+| **Claim-time authorization snapshot** for agent tool calls | An agent gaining a tool grant mid-execution; revocation latency bounded by attempt duration, not a cache TTL |
 
-Anyone claiming exactly-once without a transactional sink is wrong or hiding a two-phase commit.
+## The stale-worker race
 
-## 6. The stale-worker race
+This is the failure the whole design exists to survive, and it's reproduced **deterministically** — no sleeps, no timing luck — in [`tests/chaos/test_stale_worker_race.py`](tests/chaos/test_stale_worker_race.py):
 
-The failure this design exists for — reproduced deterministically in [`tests/chaos/test_stale_worker_race.py`](tests/chaos/test_stale_worker_race.py), with no sleeps:
+```mermaid
+sequenceDiagram
+    participant A as Worker A
+    participant DB as PostgreSQL
+    participant R as Reaper
+    participant B as Worker B
 
+    A->>DB: claim task 10 (state→RUNNING, attempt=1, lease=t+30s)
+    Note over A: A freezes (paused / partitioned).<br/>Still alive — not crashed.
+    Note over DB: t=30s: lease expires. Nothing happens yet — expiry is passive.
+    R->>DB: sweep: lease_expires_at < now() → requeue<br/>(state→QUEUED, attempt UNCHANGED = 1)
+    B->>DB: claim task 10 (state→RUNNING, attempt=2, lease=t+30s)
+    Note over A,B: Both A and B are now executing task 10.<br/>Expected and unavoidable — this is the race.
+    A->>DB: commit result: WHERE attempt=1 AND lease_worker='A'
+    DB-->>A: 0 rows matched → REJECTED
+    Note over A: STALE_WRITE_REJECTED event.<br/>acp_stale_writes_rejected_total incremented.
+    B->>DB: commit result: WHERE attempt=2 AND lease_worker='B'
+    DB-->>B: 1 row matched → SUCCEEDED
 ```
-t=0    Worker A claims task 10        attempt=1, lease → t+30
-t=8    A's host freezes.  A is NOT dead — still executing in memory.
-t=30   lease expires (passively; expiry does nothing on its own)
-t=31   reaper:  state → QUEUED, lease cleared.  attempt STAYS 1.
-t=32   Worker B claims                attempt=2
-       ⚠  A and B are both executing task 10. Expected and unavoidable.
-t=90   A unfreezes and commits:
-         UPDATE ... WHERE attempt=1 AND lease_worker_id='A' → 0 ROWS
-       → STALE_WRITE_REJECTED event + acp_stale_writes_rejected_total
-t=95   B commits with attempt=2 → SUCCEEDED
+
+The mechanism: `attempt` is a fencing token allocated by the **same** `UPDATE` that grants the lease, so ownership and token can never disagree. Recovery (`RUNNING → QUEUED`) never bumps it — only the next claim does — so a worker that comes back late presents a stale token and matches zero rows on every write it attempts. Exactly one attempt is ever recorded `SUCCEEDED`; the stored result is the live owner's.
+
+This does **not** stop Worker A's real-world side effects (an API call it made while frozen already happened). It stops the *database* from ever recording two committed outcomes for one task. See [Execution semantics](#execution-semantics) for exactly what is and isn't guaranteed.
+
+## Testing strategy
+
+The test suite is layered by what each layer proves — not "a comprehensive test suite," specific guarantees with specific tests:
+
+| Layer | Proves | Example |
+|---|---|---|
+| `tests/unit/` (no database) | The state machine's full legality table — all 25 ordered state pairs, not a sample | [`test_state_machine.py`](tests/unit/test_state_machine.py) |
+| `tests/concurrency/` (real Postgres, real contention) | 50 concurrent transactions racing to claim one row produce exactly one winner | [`test_transition_cas.py`](tests/concurrency/test_transition_cas.py) |
+| `tests/chaos/` (deterministic, no sleeps) | The stale-worker race above, plus: a reaper that reclaims a task never loses to a worker that renews just in time; concurrent reap-vs-completion produces exactly one outcome | [`test_stale_worker_race.py`](tests/chaos/test_stale_worker_race.py) |
+| `tests/integration/` (real Postgres, full stack) | Idempotent submission under 25 concurrent duplicate requests; per-tenant admission isolation (one busy tenant can't lock another out); an `EXPLAIN`-based regression test asserting the claim query hits its index with **no Sort node** | [`test_idempotent_submit.py`](tests/integration/test_idempotent_submit.py), [`test_admission_control.py`](tests/integration/test_admission_control.py), [`test_claim_plan.py`](tests/integration/test_claim_plan.py) |
+
+The `EXPLAIN` test is worth calling out specifically: a correctness test cannot catch a missing index, because the query returns identical rows whether PostgreSQL sorts 2,000 rows in memory or walks an index that's already in the right order. Only reading the actual query plan catches it.
+
+```bash
+.\make.ps1 test-unit    # pure domain — no database, ~0.05s
+.\make.ps1 test-db      # integration + concurrency, real PostgreSQL
+.\make.ps1 test-race    # concurrency suite ×20, to prove it isn't flaky
 ```
 
-Exactly one attempt is recorded `SUCCEEDED`; the stored result is the live owner's. The fence guarantees at-most-once **committed outcome** — it does not stop A's external side effects, which is why the guarantee table above says what it says.
+## Failure model
 
-## 7. Demos
+| Scenario | Detection | System behavior |
+|---|---|---|
+| Worker crashes (`SIGKILL`) | Lease expiry, noticed by the reaper | Task requeued within `lease_ttl + reaper_period`; attempt recorded `LOST` |
+| Worker stops heartbeating | Missed heartbeat window | Worker marked dead; its **next** heartbeat attempt is rejected, so it self-fences and exits rather than keep claiming |
+| Lease expires | Reaper sweep (`lease_expires_at < now()`) | `RUNNING → QUEUED`, attempt token unchanged, ready for reclaim |
+| Stale worker returns and tries to write | CAS predicate on `(state, attempt, lease_worker_id)` | Write matches 0 rows → rejected, counted in `acp_stale_writes_rejected_total`, task keeps the new owner's result |
+| Graceful shutdown (`SIGTERM`) | Self-reported drain | Unfinished work handed back immediately (`available_at = now()`); recovery ≈ 0s instead of waiting out the lease |
+| Duplicate submission | Partial unique index on `(tenant_id, idempotency_key)` | Second request returns the **same** task, `200` instead of `201` — never a second row |
+| Task fails (retryable) | Failure classified (rate-limited / timeout / permanent / unknown) | Requeued with full-jitter exponential backoff sized to the failure class; a killed worker's task retries with **zero** backoff, since the task itself didn't misbehave |
+| Task fails (permanent / bad input) | Failure classified as non-retryable | Marked `FAILED` immediately — never burns retry budget on an error that can't change |
+| Tenant capacity exhausted | Exact per-tenant queue-depth count | `429`, with `Retry-After` — this tenant's own backlog, independent of system health |
+| System-wide overload | Approximate, Prometheus-cached global queue depth | `503`, with `Retry-After` — checked only *after* tenant quota clears, so it's never a cover for a tenant's own problem |
+| PostgreSQL unavailable | Every query fails | **Total outage — the accepted single point of failure.** Workers abort in-flight tasks rather than commit results they can't prove they still own |
+
+## Execution semantics
+
+Stated precisely, because "fault-tolerant" and "exactly-once" are usually where a project's honesty runs out:
+
+| Property | Guarantee |
+|---|---|
+| Delivery | **At-least-once.** A task can be handed to more than one worker (see the stale-worker race above). |
+| Committed outcome | **At-most-once.** The CAS predicate guarantees exactly one attempt ever writes a terminal state. |
+| Side effects | **At-least-once, and only as strong as the downstream system's own idempotency.** Fencing stops the database from recording two outcomes; it does **not** undo an HTTP call a stale worker already made before it lost ownership. |
+| Ordering | None guaranteed across attempts. Retry N does not know what retry N-1 did unless the adapter itself is idempotent. |
+| Concurrent execution | Possible and expected during a lease handoff — Worker A and B can both be running the same task briefly. Only one commit wins. |
+
+**What fencing protects:** the row in `tasks` — its state, its result, its terminal outcome. **What it does not protect:** anything the stale worker did to the outside world before its write was rejected. There is no two-phase commit between this system and an external API, so this project does not claim exactly-once execution — that claim is only honest with a transactional sink, and this system doesn't have one.
+
+## Observability
+
+Metrics are namespaced `acp_*`, and cardinality is treated as a design constraint rather than an afterthought: `task_id`, `worker_id`, and `idempotency_key` are never label values. (`worker_id` is the subtle one — worker identities are generation-unique per process start, so using it as a label would mint a new time series on every deploy. A unit test enforces this.)
+
+Metrics worth knowing about: `acp_stale_writes_rejected_total` (non-zero is *proof* the fencing token is doing its job), `acp_leases_expired_pending` (the single best alert — non-zero and rising means the reaper is behind), `acp_recovery_latency_seconds` (measures reality against the design bound), `acp_queue_wait_seconds`, `acp_admissions_total{decision}`.
+
+Distributed tracing (OpenTelemetry) links the submitting request's span to the executing worker's span **as a link, not a parent** — a task can sit queued long enough that the submitting span has already ended by the time a worker claims it, so a parent/child relationship would render as broken in most trace viewers.
+
+## Demo: kill a worker mid-flight
 
 ```bash
 docker compose up -d --build --scale worker=5
-python scripts/demo_chaos.py        # kills a worker mid-flight, proves recovery
-python scripts/demo_governance.py   # proves tool authorization is enforced at runtime
+python scripts/demo_chaos.py
 ```
 
-`demo_chaos.py` submits 300 tasks (half with real multi-second duration, so there is genuine in-flight work), waits until ≥10 are running, then `docker kill`s one worker container outright. It reports `lease_expirations_total` / `task_recoveries_total` — read from **Prometheus**, since those counters live in the reaper's and workers' own processes, never the API's — and asserts every task still reaches a terminal state. A real run: 13 leases expired, 13 recovered, 0 lost.
+Submits 300 tasks (half with genuine multi-second duration, so there's real in-flight work — an instant workload would drain before the kill ever landed on anything), waits until ≥10 are running, then `docker kill`s one worker container outright. A real run:
 
-`demo_governance.py` registers two agents with different tool grants and submits one request through each: `research-agent` (granted `web-search`) succeeds; `support-agent` reaching for `billing-db` (never granted) is refused at runtime with `PERMISSION_DENIED`, and the refusal is verified in **both** the task's event timeline and the audit log.
+```
+lease_expirations_total           13   (tasks the killed worker was holding)
+task_recoveries_total{requeued}   13   (reclaimed and re-run by a live worker)
+stale_writes_rejected_total        0   (correct — a killed process cannot write)
+tasks lost                         0
+```
 
-## 8. Local setup
+A second demo (`python scripts/demo_governance.py`) proves the tool-authorization path at runtime: an agent granted `web-search` succeeds; a different agent reaching for a tool it was never granted is refused with `PERMISSION_DENIED`, verified in both the task's event timeline and a separate audit log.
 
-Requires Docker and Python 3.12. On Windows use `.\make.ps1`; the `Makefile` mirrors it.
+## Quick start
+
+Requires Docker and Python 3.12. On Windows use `.\make.ps1`; the `Makefile` mirrors it on Linux/macOS.
 
 ```bash
 .\make.ps1 setup     # venv + dependencies
@@ -153,68 +198,61 @@ docker compose up -d --build --scale worker=3
 | Prometheus | http://localhost:9091 |
 | Grafana (anonymous admin) | http://localhost:3002 |
 
-Ports are non-default (5434/8001/9091/3002) to avoid colliding with other local stacks; override with `ACP_PG_PORT`, `ACP_API_PORT`, `ACP_PROM_PORT`, `ACP_GRAFANA_PORT`.
-
-## 9. Benchmarks
-
-Full methodology and real numbers in [docs/BENCHMARKS.md](docs/BENCHMARKS.md). Headlines from a 5-worker fleet on one machine:
-
-| | |
-|---|---|
-| SIGKILL recovery latency | **30.19s** (design bound: `lease_ttl_s + reaper_period_s` = 31s) |
-| SIGTERM (graceful) recovery latency | **0.03s** — ~943× faster than a crash |
-| Throughput bottleneck identified | Queue wait (p50 15s) vastly exceeds execution time (p50 5ms) — the ceiling is `claim_batch_size × poll_interval`, not execution capacity |
-
-The recovery-latency harness caught a bug in *itself*: its first version measured until a terminal state, so fast SIGTERM recovery (task reclaimed between two 50ms polls) was masked by the second attempt's full re-execution — there is no checkpointing, so a retry reruns the whole task. Fixed by detecting the moment `lease_worker_id` changes, which is the actual event being measured. The wrong number never shipped.
-
-## 10. Tests
+### Submit a task
 
 ```bash
-.\make.ps1 test-unit    # pure domain — no database, ~0.05s
-.\make.ps1 test-db      # integration + concurrency, real PostgreSQL
-.\make.ps1 test-race    # concurrency suite ×20, to prove it isn't flaky
+TENANT=$(curl -s -X POST http://localhost:8001/v1/tenants \
+  -H "Content-Type: application/json" -d '{"name": "acme"}' | jq -r .id)
+
+curl -s -X POST http://localhost:8001/v1/tasks \
+  -H "Content-Type: application/json" \
+  -d "{\"tenant_id\": \"$TENANT\", \"task_type\": \"demo.agent\", \"payload\": {}}"
 ```
 
-The suite is layered by what it proves:
+Submitting the same request again with an `idempotency_key` returns the same task (`200`) instead of creating a second one (`201`).
 
-- **`tests/unit/`** — the state machine's full transition table (all 25 ordered pairs), an import-boundary check keeping `domain/` free of I/O, and a **metric cardinality guard** that fails if any metric gains a `task_id`/`worker_id`-shaped label.
-- **`tests/integration/`** — real PostgreSQL, full request and worker flows. Includes an **EXPLAIN-based plan regression test** asserting the claim query uses `idx_tasks_ready` with **no Sort node** — a correctness test cannot catch this, because the query returns identical rows either way.
-- **`tests/concurrency/`** — genuine contention (50 concurrent claims of one task, etc.) on real connections, not a mocked model of locking.
-- **`tests/chaos/`** — worker death, stale writes, reaper races.
+## Repository structure
 
-## 11. Failure model
+```
+src/acp/
+  domain/       pure logic — state machine, retry policy, authorization
+                (no I/O; enforced by an import-boundary test)
+  db/queries/   the only place CAS/claim/lease SQL lives
+  api/          FastAPI app, routes, admission control
+  worker/       the worker process — claim, renew, execute, complete
+  reaper/       singleton sweep — expired leases, dead workers
+  scheduling/   claim policy (pure) vs. claim mechanism (SQL), kept separate
+  obs/          Prometheus metrics, structured logs, OpenTelemetry tracing
+migrations/     Alembic — run against a real Postgres in every test session
+tests/
+  unit/         pure domain logic, no database
+  integration/  real Postgres, full request/worker flows
+  concurrency/  genuine contention, not mocked locking
+  chaos/        deterministic failure injection, no sleeps
+load/           benchmark harnesses (throughput, recovery latency)
+scripts/        the two live demos
+docs/           architecture rationale, benchmarks
+```
 
-| Failure | Detection | Behaviour |
-|---|---|---|
-| Worker `SIGKILL` | Lease expiry | Tasks requeued in ≤ `lease_ttl + reaper_period`; attempt recorded `LOST` |
-| Worker `SIGTERM` | Self-reported drain | Work handed back with `available_at = now()`; recovery ~0s; attempt `ABANDONED` |
-| Worker declared DEAD | Heartbeat rejected | Worker **self-fences**: stops claiming, exits, restarts with a fresh id |
-| Reaper crash | Advisory absence | Recovery *latency* degrades; correctness does not. Nothing corrupts. |
-| API crash | Client error | Retry with the same idempotency key → deduped by a partial unique index |
-| PostgreSQL down | Everything fails | **Total outage — the deliberate V1 SPOF.** Workers abort rather than work on tasks they cannot prove they own. |
-| Poison-pill task | `attempt` counts every handoff | Exhausts `max_attempts` → `FAILED`, instead of killing workers forever |
-| Clock skew | — | **Cannot occur.** Only PostgreSQL's clock is ever compared. |
+## Tradeoffs
 
-Two gaps are documented rather than hidden: a **hung worker** that keeps renewing is never detected (needs `max_execution_time`), and PostgreSQL is a single point of failure.
+- **PostgreSQL as the queue, no Redis.** `SKIP LOCKED` over a partial index is a production-grade queue at this scale. A second store means a second source of truth for no measured benefit yet — Redis earns its place when a benchmark shows claim contention or rate-limiting as the actual bottleneck.
+- **Pull-based claiming, no central dispatcher.** A central scheduler is a singleton bottleneck needing leader election. Policy (what to prioritize) is still a separate, pure module from mechanism (the SQL), so the two can evolve independently.
+- **Tenant limits enforced at claim time, not submit time** — a busy tenant degrades in latency, not in errors.
+- **No Kafka.** This needs per-item random-access mutation (extend this lease, cancel that task) — the opposite of what an append-only log is for.
+- **No Kubernetes.** It schedules containers; this schedules tasks, which is the actual interesting problem here.
 
-## 12. Observability
+## Recommended Engineering Improvements
 
-Metrics are namespaced `acp_*` and split by ownership: each process exports its own counters, the API exports the DB-derived gauges. Scrapes read memory only — monitoring must not be able to cause the incident it observes.
+Gaps left open deliberately, not hidden:
 
-Notable metrics: `acp_stale_writes_rejected_total` (the fencing evidence), `acp_recovery_latency_seconds` (checks reality against the designed bound), `acp_leases_expired_pending` (the best single alert: non-zero means the reaper is down or behind), `acp_queue_wait_seconds`, `acp_claim_duration_seconds`.
+- **Hung-worker detection is missing.** A worker that keeps renewing its lease but is actually stuck in an infinite loop is never detected — there's no `max_execution_time` ceiling yet. The fix is straightforward (compare `task_attempts.started_at` against a cap in the reaper sweep) but isn't built.
+- **PostgreSQL is a single point of failure.** Accepted for this stage of the project; a real deployment would need a Patroni/HA setup, which is out of scope here.
+- **Capability-aware claiming degrades under a specific load shape.** A specialist worker facing a deep queue of work it can't run scans the whole queue (measured at ~47ms for a 2,000-row queue) because capability matching is a filter, not part of the index key. `tasks.capability_key` already exists, unused, for the keyed-index fix.
+- **No checkpointing.** A retried task reruns from the beginning; there's no mechanism to resume a long-running agent from its last completed step. Scoped out of this project on purpose — it's the highest-effort, lowest-marginal-insight remaining phase.
+- **Tenant concurrency limiting is a soft check**, not a hard atomic counter — under heavy concurrent claiming a tenant can briefly overshoot its `max_concurrent_tasks`. Bounded, but not exact.
 
-**Cardinality is treated as a design constraint.** `task_id`, `worker_id`, and `idempotency_key` are never labels. `worker_id` is the subtle one: ids are generation-unique per process start, so a fleet redeploying daily would mint new time series daily, forever — low cardinality at any instant, unbounded over time. A unit test enforces this.
-
-## 13. Tradeoffs
-
-- **PostgreSQL as the queue, no Redis.** `SELECT ... FOR UPDATE SKIP LOCKED` over partial indexes is a production-grade queue. A second store means a second source of truth and a new failure mode, for no measured benefit at this scale. Redis earns its place when a benchmark shows claim contention, high-rate rate limiting, or polling latency as the bottleneck — `LISTEN/NOTIFY` should be tried first.
-- **Pull-based claiming, no central dispatcher.** A central scheduler is a singleton bottleneck needing leader election and an extra `ASSIGNED` state with its own timeout. Scheduling *policy* still lives in its own pure module, so the mechanism can be swapped without touching it.
-- **Lease inlined on the task row.** Lease grant and state transition must be atomic anyway, so a separate table buys only a join on the hottest query.
-- **Tenant limits are enforced at claim time, not submit time**, so a busy tenant degrades in latency rather than getting errors.
-- **No Kafka** — wrong data model. This needs per-item random-access mutation (extend this lease, cancel that task), which is the opposite of a log.
-- **No Kubernetes** — it schedules containers; this schedules tasks, which is the interesting half.
-
-## 14. Roadmap
+## Roadmap
 
 | Phase | Status |
 |---|---|
@@ -230,4 +268,6 @@ Notable metrics: `acp_stale_writes_rejected_total` (the fencing evidence), `acp_
 | 9 — admission control, backpressure, 429 vs 503 | ✅ |
 | 10 — OpenTelemetry tracing, Grafana dashboards, the two demos | ✅ |
 | 11 — benchmarks with methodology | ✅ |
-| 12 — checkpointing (optional) | ⬜ |
+| 12 — checkpointing (optional, not planned near-term) | ⬜ |
+
+Full technical rationale — architecture decisions, tradeoff analysis, benchmark methodology — lives in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) and inline in the source; every module docstring explains the *why*, not just the *what*.
