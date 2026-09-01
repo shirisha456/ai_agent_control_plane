@@ -4,7 +4,7 @@ Distributed infrastructure for scheduling and reliably executing AI agent worklo
 
 The project focuses particularly deeply on **execution correctness under concurrency and partial failure** — lease-based ownership, fencing tokens, compare-and-set state transitions, and bounded failure recovery. AI agents are the workload; distributed systems are the project.
 
-> **Status:** phases 0–10 of 11 are implemented (state machine, Control API, worker fleet, reaper-based recovery, observability, failure classification and retry, agent registry with immutable versions, tool registry with runtime authorization and an audit log, capability-aware placement, admission control, distributed tracing and both flagship demos). Only benchmarks remain.
+> **Status:** all 11 phases are implemented and benchmarked. See [BENCHMARKS.md](docs/BENCHMARKS.md) for methodology and real numbers -- nothing below is estimated.
 
 ---
 
@@ -149,7 +149,19 @@ docker compose up -d --build --scale worker=3
 
 Ports are non-default (5434/8001/9091/3002) to avoid colliding with other local stacks; override with `ACP_PG_PORT`, `ACP_API_PORT`, `ACP_PROM_PORT`, `ACP_GRAFANA_PORT`.
 
-## 9. Tests
+## 9. Benchmarks
+
+Full methodology and real numbers in [docs/BENCHMARKS.md](docs/BENCHMARKS.md). Headlines from a 5-worker fleet on one machine:
+
+| | |
+|---|---|
+| SIGKILL recovery latency | **30.19s** (design bound: `lease_ttl_s + reaper_period_s` = 31s) |
+| SIGTERM (graceful) recovery latency | **0.03s** — ~943× faster than a crash |
+| Throughput bottleneck identified | Queue wait (p50 15s) vastly exceeds execution time (p50 5ms) — the ceiling is `claim_batch_size × poll_interval`, not execution capacity |
+
+The recovery-latency harness caught a bug in *itself*: its first version measured until a terminal state, so fast SIGTERM recovery (task reclaimed between two 50ms polls) was masked by the second attempt's full re-execution — there is no checkpointing, so a retry reruns the whole task. Fixed by detecting the moment `lease_worker_id` changes, which is the actual event being measured. The wrong number never shipped.
+
+## 10. Tests
 
 ```bash
 .\make.ps1 test-unit    # pure domain — no database, ~0.05s
@@ -164,7 +176,7 @@ The suite is layered by what it proves:
 - **`tests/concurrency/`** — genuine contention (50 concurrent claims of one task, etc.) on real connections, not a mocked model of locking.
 - **`tests/chaos/`** — worker death, stale writes, reaper races.
 
-## 10. Failure model
+## 11. Failure model
 
 | Failure | Detection | Behaviour |
 |---|---|---|
@@ -179,7 +191,7 @@ The suite is layered by what it proves:
 
 Two gaps are documented rather than hidden: a **hung worker** that keeps renewing is never detected (needs `max_execution_time`), and PostgreSQL is a single point of failure.
 
-## 11. Observability
+## 12. Observability
 
 Metrics are namespaced `acp_*` and split by ownership: each process exports its own counters, the API exports the DB-derived gauges. Scrapes read memory only — monitoring must not be able to cause the incident it observes.
 
@@ -187,7 +199,7 @@ Notable metrics: `acp_stale_writes_rejected_total` (the fencing evidence), `acp_
 
 **Cardinality is treated as a design constraint.** `task_id`, `worker_id`, and `idempotency_key` are never labels. `worker_id` is the subtle one: ids are generation-unique per process start, so a fleet redeploying daily would mint new time series daily, forever — low cardinality at any instant, unbounded over time. A unit test enforces this.
 
-## 12. Tradeoffs
+## 13. Tradeoffs
 
 - **PostgreSQL as the queue, no Redis.** `SELECT ... FOR UPDATE SKIP LOCKED` over partial indexes is a production-grade queue. A second store means a second source of truth and a new failure mode, for no measured benefit at this scale. Redis earns its place when a benchmark shows claim contention, high-rate rate limiting, or polling latency as the bottleneck — `LISTEN/NOTIFY` should be tried first.
 - **Pull-based claiming, no central dispatcher.** A central scheduler is a singleton bottleneck needing leader election and an extra `ASSIGNED` state with its own timeout. Scheduling *policy* still lives in its own pure module, so the mechanism can be swapped without touching it.
@@ -196,7 +208,7 @@ Notable metrics: `acp_stale_writes_rejected_total` (the fencing evidence), `acp_
 - **No Kafka** — wrong data model. This needs per-item random-access mutation (extend this lease, cancel that task), which is the opposite of a log.
 - **No Kubernetes** — it schedules containers; this schedules tasks, which is the interesting half.
 
-## 13. Roadmap
+## 14. Roadmap
 
 | Phase | Status |
 |---|---|
@@ -211,5 +223,5 @@ Notable metrics: `acp_stale_writes_rejected_total` (the fencing evidence), `acp_
 | 8 — capability-aware placement | ✅ |
 | 9 — admission control, backpressure, 429 vs 503 | ✅ |
 | 10 — OpenTelemetry tracing, Grafana dashboards, the two demos | ✅ |
-| 11 — benchmarks with methodology | ⬜ |
+| 11 — benchmarks with methodology | ✅ |
 | 12 — checkpointing (optional) | ⬜ |
