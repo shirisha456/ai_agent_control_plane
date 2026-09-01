@@ -1,8 +1,6 @@
 # AI Agent Control Plane
 
-Distributed scheduler and durable execution engine for AI agent workloads — built around lease-based ownership, monotonic fencing tokens, and compare-and-set state transitions, so that worker crashes, retries, and duplicate submissions are handled by construction, not by hope.
-
-**AI agents are the workload. Distributed systems is the project.**
+Distributed scheduler and durable execution engine for AI agent workloads — built around lease-based ownership, monotonic fencing tokens, and compare-and-set state transitions, so that worker crashes, retries, and duplicate submissions are handled by construction, not by hope. The agents are the workload; the scheduling, concurrency, and recovery guarantees underneath them are what this project is actually about.
 
 `Python · FastAPI · PostgreSQL · SQLAlchemy Core · Docker · Prometheus · Grafana · OpenTelemetry`
 
