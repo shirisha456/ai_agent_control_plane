@@ -41,7 +41,7 @@ from acp.domain.errors import FailureClass, classify, retry_after_of
 from acp.domain.retry import RetryDecision
 from acp.domain.retry import decide as decide_retry
 from acp.domain.states import EventType
-from acp.obs import metrics
+from acp.obs import metrics, tracing
 from acp.obs.logging import get_logger
 from acp.scheduling.policy import DEFAULT_POLICY, ClaimPolicy
 
@@ -264,23 +264,33 @@ class Worker:
 
     async def _claim_and_dispatch(self, limit: int) -> None:
         started = time.monotonic()
-        async with transaction() as conn:
-            claimed = await claim_tasks(
-                conn,
-                worker_id=self.worker_id,
-                limit=min(limit, self.settings.claim_batch_size),
-                lease_ttl_s=self.settings.lease_ttl_s,
-                policy=self.policy,
-                worker_capabilities=self.capabilities,
-            )
-            # Freeze each claimed version's tool policy in the SAME
-            # transaction. A small lookup on the handful of rows the claim
-            # returned -- the ordering scan does not pay for it. Doing it here
-            # rather than at tool-call time means the policy is consistent for
-            # the whole attempt and the tool path needs no query at all.
-            policies = await snapshot_policies(
-                conn, agent_version_ids=[r["agent_version_id"] for r in claimed]
-            )
+        # The span wraps ONLY the claim query and policy snapshot, not the
+        # dispatch loop below. asyncio.ensure_future copies the current OTel
+        # context at Task-creation time, so scheduling _run_attempt while
+        # this span were still open would make each task's execution span a
+        # CHILD of this short-lived claim span -- reconstructing, one hop
+        # later, exactly the "child outlives its parent" problem that the
+        # submit -> execute link exists to avoid (a claim finishes in
+        # milliseconds; the tasks it claims can run for minutes).
+        with tracing.span("acp.worker.claim", attributes={"acp.worker_id": self.worker_id}):
+            async with transaction() as conn:
+                claimed = await claim_tasks(
+                    conn,
+                    worker_id=self.worker_id,
+                    limit=min(limit, self.settings.claim_batch_size),
+                    lease_ttl_s=self.settings.lease_ttl_s,
+                    policy=self.policy,
+                    worker_capabilities=self.capabilities,
+                )
+                # Freeze each claimed version's tool policy in the SAME
+                # transaction. A small lookup on the handful of rows the claim
+                # returned -- the ordering scan does not pay for it. Doing it
+                # here rather than at tool-call time means the policy is
+                # consistent for the whole attempt and the tool path needs no
+                # query at all.
+                policies = await snapshot_policies(
+                    conn, agent_version_ids=[r["agent_version_id"] for r in claimed]
+                )
         metrics.claim_duration.observe(time.monotonic() - started)
         metrics.claim_batch.observe(len(claimed))
 
@@ -300,6 +310,25 @@ class Worker:
             self._inflight.add(asyncio.ensure_future(self._run_attempt(row, policy)))
 
     async def _run_attempt(self, row: Mapping[str, Any], policy: ToolPolicy = UNGOVERNED) -> None:
+        with tracing.span(
+            "acp.task.execute",
+            attributes={
+                **tracing.task_attributes(
+                    task_id=row["id"], tenant_id=row["tenant_id"], task_type=row["task_type"]
+                ),
+                "acp.attempt": row["attempt"],
+                "acp.worker_id": self.worker_id,
+            },
+            # A LINK, not a parent: the submitting request's span may have
+            # ended long before this claim, especially if the task waited out
+            # a retry backoff. See obs/tracing's module docstring.
+            link_carrier=(row["payload"] or {}).get("_trace"),
+        ):
+            await self._run_attempt_inner(row, policy)
+
+    async def _run_attempt_inner(
+        self, row: Mapping[str, Any], policy: ToolPolicy = UNGOVERNED
+    ) -> None:
         task_id = row["id"]
         attempt = row["attempt"]
         task_type = row["task_type"]
@@ -350,6 +379,29 @@ class Worker:
             # back. Leaving it in _owned would make drain try to abandon a
             # task another worker now owns -- fenced out, but noisy.
             self._owned.pop(task_id, None)
+
+    def _traced_invoker(self, task_id: Any, attempt: int) -> tool_runtime.ToolInvoker:
+        """Wrap the configured invoker so every tool call gets its own span.
+
+        A separate span from the attempt's, because a task may call several
+        tools and each call's own latency and success/failure is the thing
+        worth seeing on its own timeline entry, not folded into one giant
+        execution span.
+        """
+
+        async def _invoke(tool, request):
+            with tracing.span(
+                "acp.tool.call",
+                attributes={
+                    "acp.task_id": str(task_id),
+                    "acp.attempt": attempt,
+                    "acp.tool": tool.name,
+                    "acp.tool_type": tool.tool_type.value,
+                },
+            ):
+                return await self.tool_invoker(tool, request)
+
+        return _invoke
 
     def _tool_access(self, row: Mapping[str, Any], policy: ToolPolicy) -> tool_runtime.ToolAccess:
         task_id = row["id"]
@@ -427,7 +479,7 @@ class Worker:
 
         return tool_runtime.ToolAccess(
             policy=policy,
-            invoker=self.tool_invoker,
+            invoker=self._traced_invoker(task_id, attempt),
             on_decision=on_decision,
             on_executed=on_executed,
         )
@@ -435,8 +487,11 @@ class Worker:
     async def _execute(
         self, adapter: Adapter, row: Mapping[str, Any], cancelled: asyncio.Event
     ) -> tuple[str, Any]:
+        # `_trace` is transport for the span link (see obs/tracing), not part
+        # of the task's actual input. Adapters should never see it.
+        payload = {k: v for k, v in (row["payload"] or {}).items() if k != "_trace"}
         try:
-            result = await adapter.run(row["payload"], is_cancelled=cancelled.is_set)
+            result = await adapter.run(payload, is_cancelled=cancelled.is_set)
         except Exception as exc:  # noqa: BLE001 - adapter errors are data, not our bug
             # One except clause, because the decision is no longer "was this
             # the retryable exception type" but "what class of failure is

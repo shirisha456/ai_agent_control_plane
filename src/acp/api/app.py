@@ -12,6 +12,7 @@ from acp.config import settings
 from acp.db.session import dispose_engine, engine
 from acp.obs.gauges import run_refresher
 from acp.obs.logging import configure_logging, get_logger
+from acp.obs.tracing import configure_tracing
 
 log = get_logger(__name__)
 
@@ -20,6 +21,11 @@ log = get_logger(__name__)
 async def lifespan(app: FastAPI):
     s = settings()
     configure_logging(s.log_level, s.log_format)
+    configure_tracing(
+        service_name=f"{s.otel_service_name}-api",
+        otlp_endpoint=s.otel_endpoint,
+        console=s.otel_console,
+    )
     log.info(
         "api.start",
         lease_ttl_s=s.lease_ttl_s,

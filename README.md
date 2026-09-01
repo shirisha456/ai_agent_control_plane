@@ -4,7 +4,7 @@ Distributed infrastructure for scheduling and reliably executing AI agent worklo
 
 The project focuses particularly deeply on **execution correctness under concurrency and partial failure** — lease-based ownership, fencing tokens, compare-and-set state transitions, and bounded failure recovery. AI agents are the workload; distributed systems are the project.
 
-> **Status:** phases 0–9 of 11 are implemented (state machine, Control API, worker fleet, reaper-based recovery, observability, failure classification and retry, agent registry with immutable versions, tool registry with runtime authorization and an audit log, capability-aware placement, admission control). OpenTelemetry tracing, Grafana dashboards, and benchmarks are not built yet.
+> **Status:** phases 0–10 of 11 are implemented (state machine, Control API, worker fleet, reaper-based recovery, observability, failure classification and retry, agent registry with immutable versions, tool registry with runtime authorization and an audit log, capability-aware placement, admission control, distributed tracing and both flagship demos). Only benchmarks remain.
 
 ---
 
@@ -112,7 +112,19 @@ t=95   B commits with attempt=2 → SUCCEEDED
 
 Exactly one attempt is recorded `SUCCEEDED`; the stored result is the live owner's. The fence guarantees at-most-once **committed outcome** — it does not stop A's external side effects, which is why the guarantee table above says what it says.
 
-## 7. Local setup
+## 7. Demos
+
+```bash
+docker compose up -d --build --scale worker=5
+python scripts/demo_chaos.py        # kills a worker mid-flight, proves recovery
+python scripts/demo_governance.py   # proves tool authorization is enforced at runtime
+```
+
+`demo_chaos.py` submits 300 tasks (half with real multi-second duration, so there is genuine in-flight work), waits until ≥10 are running, then `docker kill`s one worker container outright. It reports `lease_expirations_total` / `task_recoveries_total` — read from **Prometheus**, since those counters live in the reaper's and workers' own processes, never the API's — and asserts every task still reaches a terminal state. A real run: 13 leases expired, 13 recovered, 0 lost.
+
+`demo_governance.py` registers two agents with different tool grants and submits one request through each: `research-agent` (granted `web-search`) succeeds; `support-agent` reaching for `billing-db` (never granted) is refused at runtime with `PERMISSION_DENIED`, and the refusal is verified in **both** the task's event timeline and the audit log.
+
+## 8. Local setup
 
 Requires Docker and Python 3.12. On Windows use `.\make.ps1`; the `Makefile` mirrors it.
 
@@ -137,7 +149,7 @@ docker compose up -d --build --scale worker=3
 
 Ports are non-default (5434/8001/9091/3002) to avoid colliding with other local stacks; override with `ACP_PG_PORT`, `ACP_API_PORT`, `ACP_PROM_PORT`, `ACP_GRAFANA_PORT`.
 
-## 8. Tests
+## 9. Tests
 
 ```bash
 .\make.ps1 test-unit    # pure domain — no database, ~0.05s
@@ -152,7 +164,7 @@ The suite is layered by what it proves:
 - **`tests/concurrency/`** — genuine contention (50 concurrent claims of one task, etc.) on real connections, not a mocked model of locking.
 - **`tests/chaos/`** — worker death, stale writes, reaper races.
 
-## 9. Failure model
+## 10. Failure model
 
 | Failure | Detection | Behaviour |
 |---|---|---|
@@ -167,7 +179,7 @@ The suite is layered by what it proves:
 
 Two gaps are documented rather than hidden: a **hung worker** that keeps renewing is never detected (needs `max_execution_time`), and PostgreSQL is a single point of failure.
 
-## 10. Observability
+## 11. Observability
 
 Metrics are namespaced `acp_*` and split by ownership: each process exports its own counters, the API exports the DB-derived gauges. Scrapes read memory only — monitoring must not be able to cause the incident it observes.
 
@@ -175,7 +187,7 @@ Notable metrics: `acp_stale_writes_rejected_total` (the fencing evidence), `acp_
 
 **Cardinality is treated as a design constraint.** `task_id`, `worker_id`, and `idempotency_key` are never labels. `worker_id` is the subtle one: ids are generation-unique per process start, so a fleet redeploying daily would mint new time series daily, forever — low cardinality at any instant, unbounded over time. A unit test enforces this.
 
-## 11. Tradeoffs
+## 12. Tradeoffs
 
 - **PostgreSQL as the queue, no Redis.** `SELECT ... FOR UPDATE SKIP LOCKED` over partial indexes is a production-grade queue. A second store means a second source of truth and a new failure mode, for no measured benefit at this scale. Redis earns its place when a benchmark shows claim contention, high-rate rate limiting, or polling latency as the bottleneck — `LISTEN/NOTIFY` should be tried first.
 - **Pull-based claiming, no central dispatcher.** A central scheduler is a singleton bottleneck needing leader election and an extra `ASSIGNED` state with its own timeout. Scheduling *policy* still lives in its own pure module, so the mechanism can be swapped without touching it.
@@ -184,7 +196,7 @@ Notable metrics: `acp_stale_writes_rejected_total` (the fencing evidence), `acp_
 - **No Kafka** — wrong data model. This needs per-item random-access mutation (extend this lease, cancel that task), which is the opposite of a log.
 - **No Kubernetes** — it schedules containers; this schedules tasks, which is the interesting half.
 
-## 12. Roadmap
+## 13. Roadmap
 
 | Phase | Status |
 |---|---|
@@ -198,6 +210,6 @@ Notable metrics: `acp_stale_writes_rejected_total` (the fencing evidence), `acp_
 | 7 — tool registry, versioned grants, runtime authorization, audit log | ✅ |
 | 8 — capability-aware placement | ✅ |
 | 9 — admission control, backpressure, 429 vs 503 | ✅ |
-| 10 — OpenTelemetry tracing, Grafana dashboards, the two demos | ⬜ |
+| 10 — OpenTelemetry tracing, Grafana dashboards, the two demos | ✅ |
 | 11 — benchmarks with methodology | ⬜ |
 | 12 — checkpointing (optional) | ⬜ |

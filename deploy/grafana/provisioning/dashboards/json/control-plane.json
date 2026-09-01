@@ -1,0 +1,113 @@
+{
+  "title": "AI Agent Control Plane",
+  "uid": "acp-control-plane",
+  "timezone": "browser",
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "panels": [
+    {
+      "id": 1, "title": "Active workers", "type": "stat",
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 },
+      "targets": [{ "expr": "sum(acp_workers{status=\"ALIVE\"})", "legendFormat": "alive" }],
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [
+        { "color": "red", "value": null }, { "color": "green", "value": 1 } ] } }, "overrides": [] }
+    },
+    {
+      "id": 2, "title": "Queue depth (runnable)", "type": "timeseries",
+      "gridPos": { "h": 6, "w": 9, "x": 6, "y": 0 },
+      "targets": [{ "expr": "sum(acp_queue_depth)", "legendFormat": "runnable" },
+                  { "expr": "acp_tasks_backlogged", "legendFormat": "deferred (retry backoff)" }]
+    },
+    {
+      "id": 3, "title": "Tasks running", "type": "timeseries",
+      "gridPos": { "h": 6, "w": 9, "x": 15, "y": 0 },
+      "targets": [{ "expr": "sum(acp_tasks_running)", "legendFormat": "running" }]
+    },
+
+    {
+      "id": 10, "title": "Lease expirations (rate)", "type": "timeseries",
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 6 },
+      "description": "Every task the reaper found with an expired lease. A step up correlates with a worker dying.",
+      "targets": [{ "expr": "rate(acp_lease_expirations_total[1m])", "legendFormat": "expirations/s" }]
+    },
+    {
+      "id": 11, "title": "Task recoveries by disposition", "type": "timeseries",
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 6 },
+      "description": "requeued = went back to the queue; failed_exhausted = ran out of attempts.",
+      "targets": [
+        { "expr": "rate(acp_task_recoveries_total{disposition=\"requeued\"}[1m])", "legendFormat": "requeued/s" },
+        { "expr": "rate(acp_task_recoveries_total{disposition=\"failed_exhausted\"}[1m])", "legendFormat": "failed_exhausted/s" }
+      ]
+    },
+    {
+      "id": 12, "title": "Stale writes rejected (the fencing proof)", "type": "timeseries",
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 6 },
+      "description": "A non-zero rate is the PROOF the fencing token works: a worker that lost its lease tried to commit anyway and was rejected.",
+      "targets": [{ "expr": "rate(acp_stale_writes_rejected_total[1m])", "legendFormat": "{{rejection}}/s" }]
+    },
+
+    {
+      "id": 20, "title": "Recovery latency (p50 / p95 / p99)", "type": "timeseries",
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 13 },
+      "description": "From lease expiry to reclaim. Design bound is lease_ttl_s + reaper_period_s -- this is where you check reality against it.",
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum(rate(acp_recovery_latency_seconds_bucket[5m])) by (le))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.95, sum(rate(acp_recovery_latency_seconds_bucket[5m])) by (le))", "legendFormat": "p95" },
+        { "expr": "histogram_quantile(0.99, sum(rate(acp_recovery_latency_seconds_bucket[5m])) by (le))", "legendFormat": "p99" }
+      ]
+    },
+    {
+      "id": 21, "title": "Expired leases pending reclaim", "type": "timeseries",
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 13 },
+      "description": "The single best alert in the system. Zero when the reaper is healthy; sustained non-zero means it is down or falling behind.",
+      "targets": [{ "expr": "acp_leases_expired_pending", "legendFormat": "pending" }]
+    },
+    {
+      "id": 22, "title": "Claim latency (p50 / p99)", "type": "timeseries",
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 13 },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum(rate(acp_claim_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.99, sum(rate(acp_claim_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p99" }
+      ]
+    },
+
+    {
+      "id": 30, "title": "Task outcomes (rate)", "type": "timeseries",
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 20 },
+      "targets": [{ "expr": "sum(rate(acp_task_attempts_finished_total[1m])) by (outcome)", "legendFormat": "{{outcome}}" }]
+    },
+    {
+      "id": 31, "title": "Retries by failure class", "type": "timeseries",
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 20 },
+      "targets": [{ "expr": "sum(rate(acp_tasks_retried_total[1m])) by (error_class)", "legendFormat": "{{error_class}}" }]
+    },
+    {
+      "id": 32, "title": "Admission decisions", "type": "timeseries",
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 20 },
+      "description": "reject_tenant_backlog = 429 (you); shed_overloaded = 503 (us).",
+      "targets": [{ "expr": "sum(rate(acp_admissions_total[1m])) by (decision)", "legendFormat": "{{decision}}" }]
+    },
+
+    {
+      "id": 40, "title": "Tool calls: allowed vs denied", "type": "timeseries",
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 27 },
+      "description": "The governance demo's second proof point: a support-agent reaching for billing-db shows up here as a denial.",
+      "targets": [{ "expr": "sum(rate(acp_tool_calls_total[1m])) by (tool, decision)", "legendFormat": "{{tool}} / {{decision}}" }]
+    },
+    {
+      "id": 41, "title": "Tool access denials by reason", "type": "timeseries",
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 27 },
+      "targets": [{ "expr": "sum(rate(acp_tool_access_denied_total[1m])) by (reason)", "legendFormat": "{{reason}}" }]
+    },
+    {
+      "id": 42, "title": "Execution duration (p50 / p99) by outcome", "type": "timeseries",
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 27 },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum(rate(acp_execution_duration_seconds_bucket[5m])) by (le, outcome))", "legendFormat": "p50 {{outcome}}" },
+        { "expr": "histogram_quantile(0.99, sum(rate(acp_execution_duration_seconds_bucket[5m])) by (le, outcome))", "legendFormat": "p99 {{outcome}}" }
+      ]
+    }
+  ],
+  "schemaVersion": 39,
+  "version": 1
+}

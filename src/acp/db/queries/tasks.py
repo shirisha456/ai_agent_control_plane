@@ -35,6 +35,10 @@ class PayloadMismatch(Exception):
     """An idempotency key was reused with a different payload."""
 
 
+def _without_trace(payload: Mapping[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in payload.items() if k != "_trace"}
+
+
 async def submit_task(
     conn: AsyncConnection,
     *,
@@ -122,7 +126,12 @@ async def submit_task(
         # retry hint rather than silently returning a task that never existed.
         raise LookupError("insert conflicted but no row is visible; retry the submission")
 
-    if existing["payload"] != payload:
+    # Compare with `_trace` excluded on both sides. It carries a fresh
+    # (trace_id, span_id) on every request -- including a legitimate retry of
+    # the very same logical submission -- so including it would make an
+    # identical retry look like a payload change and spuriously raise
+    # PayloadMismatch. See obs/tracing for what `_trace` is.
+    if _without_trace(existing["payload"]) != _without_trace(payload):
         # Reusing a key with different parameters is a client bug. Returning
         # the original task with a 200 would tell the caller their NEW request
         # was accepted, which is a lie with side effects.

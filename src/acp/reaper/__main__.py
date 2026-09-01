@@ -10,6 +10,7 @@ from acp.config import settings
 from acp.db.session import dispose_engine
 from acp.obs.exporter import start_exporter
 from acp.obs.logging import configure_logging
+from acp.obs.tracing import configure_tracing
 from acp.platform import install_event_loop_policy
 from acp.reaper.loop import Reaper
 
@@ -17,6 +18,11 @@ from acp.reaper.loop import Reaper
 async def main() -> None:
     s = settings()
     configure_logging(s.log_level, s.log_format)
+    configure_tracing(
+        service_name=f"{s.otel_service_name}-reaper",
+        otlp_endpoint=s.otel_endpoint,
+        console=s.otel_console,
+    )
     start_exporter(s.metrics_port)
     reaper = Reaper(settings=settings())
 

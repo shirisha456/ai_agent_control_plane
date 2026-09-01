@@ -23,7 +23,7 @@ from acp.config import settings
 from acp.db.queries import agents as aq
 from acp.db.queries import tasks as q
 from acp.domain.states import State
-from acp.obs import metrics
+from acp.obs import metrics, tracing
 from acp.obs.gauges import cached_global_queued
 from acp.scheduling import admission
 
@@ -54,6 +54,14 @@ async def submit(body: TaskCreate, response: Response, conn: Txn) -> TaskOut:
     The status code is the only signal the caller gets that their retry was
     absorbed rather than duplicated, so it must be accurate.
     """
+    with tracing.span(
+        "acp.task.submit",
+        attributes={"acp.tenant_id": str(body.tenant_id), "acp.task_type": body.task_type},
+    ):
+        return await _submit(body, response, conn)
+
+
+async def _submit(body: TaskCreate, response: Response, conn: Txn) -> TaskOut:
     tenant = await q.get_tenant(conn, body.tenant_id)
     if tenant is None:
         raise NotFound("unknown tenant", tenant_id=str(body.tenant_id))
@@ -113,12 +121,21 @@ async def submit(body: TaskCreate, response: Response, conn: Txn) -> TaskOut:
         # rolls its limits back too.
         max_attempts = resolution.max_attempts
 
+    # A plain (trace_id, span_id) pair, not a parent context: the executing
+    # span will be created as a LINK, not a child, because this submission's
+    # span may have long since ended by the time a worker claims the task --
+    # see obs/tracing's module docstring for why a child span is wrong here.
+    payload = dict(body.payload)
+    carrier = tracing.carrier_for_current_span()
+    if carrier:
+        payload["_trace"] = carrier
+
     try:
         result = await q.submit_task(
             conn,
             tenant_id=body.tenant_id,
             task_type=task_type,
-            payload=body.payload,
+            payload=payload,
             idempotency_key=body.idempotency_key,
             priority=body.priority,
             max_attempts=max_attempts,

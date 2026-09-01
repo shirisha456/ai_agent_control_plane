@@ -12,6 +12,8 @@ recover after the fact.
 
 from __future__ import annotations
 
+import asyncio
+import random
 from collections.abc import Callable, Mapping
 from typing import Any
 
@@ -40,6 +42,35 @@ class AlwaysFailAdapter(Adapter):
         self, payload: Mapping[str, Any], *, is_cancelled: Callable[[], bool]
     ) -> Mapping[str, Any]:
         raise Retryable("demo.fail always fails")
+
+
+class SlowAdapter(Adapter):
+    """Takes real wall-clock time before succeeding.
+
+    Exists for one reason: proving that recovery works requires a worker to
+    actually be killed WHILE holding a task, and every other demo adapter
+    completes near-instantly. A benchmark or chaos demo submitting only
+    instant tasks will drain the whole batch before a `docker kill` lands on
+    anything, and "0 tasks running" the moment you check.
+
+    `duration_s` is drawn per-attempt from the payload's
+    `[min_s, max_s]` range (default 1-4s) using a seeded RNG when one is
+    given, so a benchmark run can be replayed exactly.
+    """
+
+    async def run(
+        self, payload: Mapping[str, Any], *, is_cancelled: Callable[[], bool]
+    ) -> Mapping[str, Any]:
+        low, high = payload.get("duration_s", [1.0, 4.0])
+        duration = random.uniform(low, high)
+        # Sleep in short slices so a cooperative cancel (cancel_requested)
+        # is honoured within a slice rather than only after the full sleep.
+        elapsed = 0.0
+        slice_s = 0.1
+        while elapsed < duration and not is_cancelled():
+            await asyncio.sleep(min(slice_s, duration - elapsed))
+            elapsed += slice_s
+        return {"slept_s": round(duration, 2)}
 
 
 class RateLimitedAdapter(Adapter):
@@ -83,6 +114,7 @@ class ValidatingAdapter(Adapter):
 
 def register_demo_adapters(registry: AdapterRegistry) -> None:
     registry.register("demo.agent", EchoAdapter)
+    registry.register("demo.slow", SlowAdapter)
     registry.register("demo.fail", AlwaysFailAdapter)
     registry.register("demo.rate_limited", RateLimitedAdapter)
     registry.register("demo.permanent", PermanentFailAdapter)

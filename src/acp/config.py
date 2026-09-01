@@ -56,6 +56,14 @@ class Settings(BaseSettings):
     # on with a number someone derived from a measured drain rate, not left
     # at a guess that fires during a normal burst.
     global_queue_shed_threshold: int = 0
+
+    # --- tracing -----------------------------------------------------------
+    # None (the default) means tracing is a genuine no-op: no collector
+    # dependency, no network calls. A control plane must not be able to
+    # deadlock claiming a task because its trace collector is unreachable.
+    otel_endpoint: str | None = None
+    otel_console: bool = False
+    otel_service_name: str = "acp"
     # How long a stopping worker lets in-flight attempts finish before
     # handing them back. Docker's default SIGTERM->SIGKILL window is 10s,
     # so staying under it keeps graceful shutdown actually graceful.

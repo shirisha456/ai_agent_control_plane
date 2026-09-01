@@ -13,6 +13,9 @@ dependencies = [
     "pydantic-settings>=2.6",
     "structlog>=24.4",
     "prometheus-client>=0.21",
+    "opentelemetry-api>=1.28",
+    "opentelemetry-sdk>=1.28",
+    "opentelemetry-exporter-otlp-proto-http>=1.28",
 ]
 
 [project.optional-dependencies]
