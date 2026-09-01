@@ -1,22 +1,30 @@
-"""Capability-aware claiming, and the cost of doing it as a filter.
+"""Capability-aware claiming: correctness, and the keyed merge that fixed its
+one measured degradation.
 
-The correctness half is straightforward. The interesting half is the last two
-tests, which measure the case where this design degrades -- because knowing
-where a design breaks is worth more than asserting that it works.
+The correctness half is straightforward. The interesting part is the deep-
+queue scenario: a specialist worker facing mostly-generalist work used to
+scan the whole queue rejecting nearly everything (measured ~47ms for 2,000
+rows). The claim path now uses a keyed merge instead -- see
+domain.agents.satisfiable_capability_keys and db.queries.claim -- and the
+fix is proven here with an EXPLAIN ANALYZE, not a stopwatch: a wall-clock
+timer around these tests is dominated by this environment's NullPool
+connection-establishment cost (independently measured at ~20ms for a BARE
+connect-and-SELECT-1), not by query execution.
 """
 
 from __future__ import annotations
 
 import asyncio
-import time
 import uuid
 
 import pytest
 import sqlalchemy as sa
+from sqlalchemy.dialects.postgresql import ARRAY
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 
 from acp.db.models import tasks
-from acp.db.queries.claim import claim_tasks
-from acp.domain.agents import capability_key, worker_satisfies
+from acp.db.queries.claim import _KEYED_CANDIDATES_SQL, claim_tasks
+from acp.domain.agents import capability_key, satisfiable_capability_keys, worker_satisfies
 from acp.domain.states import State
 from acp.scheduling.policy import DEFAULT_POLICY
 
@@ -155,15 +163,28 @@ async def test_capability_matching_agrees_with_the_domain_function(
 async def test_specialist_worker_still_finds_its_task_in_a_deep_queue(
     engine, make_task, make_worker
 ) -> None:
-    """The pathological case, made explicit.
+    """The pathological case, made explicit -- and now fixed.
 
-    Capability matching is a FILTER on rows the ready index returns in
-    priority order, not part of the index key. So a specialist worker facing a
-    deep queue of work it cannot run scans the whole queue rejecting nearly
-    everything. This asserts correctness (it does find its task) and records
-    the cost, which is the number that justifies the keyed-index upgrade when
-    it becomes necessary.
+    Capability matching used to be a FILTER on rows the ready index returns
+    in priority order, not part of the index key, so a specialist worker
+    facing a deep queue of work it cannot run scanned the whole queue
+    rejecting nearly everything (measured at ~47ms for this exact 2,000-row
+    scenario). The claim path now uses a keyed merge instead (see
+    domain.agents.satisfiable_capability_keys and db.queries.claim), served
+    by idx_tasks_ready_by_capability.
+
+    This test asserts correctness first, then proves the fix with an EXPLAIN
+    ANALYZE -- not a wall-clock print. A stopwatch around this test's own
+    connection is dominated by NullPool's per-call connection-establishment
+    cost on this environment (independently measured at ~20ms for a BARE
+    connect-and-SELECT-1, before any query logic at all), so it would measure
+    Windows/Docker socket overhead, not the query -- exactly the reasoning
+    that already keeps this project's real benchmarks reading from Prometheus
+    rather than a client-side clock (see docs/BENCHMARKS.md). The buffer
+    count EXPLAIN reports is server-side and environment-independent.
     """
+    worker_id = await make_worker(capabilities=["gpu"])
+
     for _ in range(2000):
         await make_task(priority=50)
     needle = await make_task(
@@ -172,16 +193,12 @@ async def test_specialist_worker_still_finds_its_task_in_a_deep_queue(
         capability_key="gpu",
     )
 
-    started = time.perf_counter()
-    claimed = await _claim(engine, await make_worker(), caps=["gpu"], limit=1)
-    elapsed = time.perf_counter() - started
-
+    claimed = await _claim(engine, worker_id, caps=["gpu"], limit=1)
     ids = [c["id"] for c in claimed]
     # The generalist tasks come first in priority order and this worker CAN run
     # them, so it takes one of those -- correct, and exactly why the needle is
     # not starved in practice.
     assert len(ids) == 1
-    print(f"\n  specialist claim over 2000-row queue: {elapsed * 1000:.1f} ms")
 
     # Drain the generalist work so only the needle remains eligible.
     async with engine.connect() as conn, conn.begin():
@@ -191,12 +208,58 @@ async def test_specialist_worker_still_finds_its_task_in_a_deep_queue(
             .values(state=State.SUCCEEDED.value, finished_at=sa.func.now())
         )
 
-    started = time.perf_counter()
-    found = [c["id"] for c in await _claim(engine, await make_worker(), caps=["gpu"], limit=1)]
-    elapsed_needle = time.perf_counter() - started
-
+    found = [c["id"] for c in await _claim(engine, worker_id, caps=["gpu"], limit=1)]
     assert found == [needle], "the only eligible task was not found"
-    print(f"  needle-only claim: {elapsed_needle * 1000:.1f} ms")
+
+
+async def test_the_keyed_merge_uses_the_capability_index_not_a_full_scan(engine, make_task) -> None:
+    """The actual proof the fix works: a real EXPLAIN ANALYZE, not a stopwatch.
+
+    2,000 generalist rows plus one deliberately-last-priority specialist row,
+    same shape as the deep-queue test above. Asserts the plan uses
+    idx_tasks_ready_by_capability and that the number of buffer pages touched
+    stays small and bounded -- NOT proportional to the 2,000-row queue depth,
+    which is exactly the property a plain containment filter could not offer.
+    """
+    for _ in range(2000):
+        await make_task(priority=50)
+    await make_task(priority=200, required_capabilities=["gpu"], capability_key="gpu")
+
+    async with engine.connect() as conn, conn.begin():
+        await conn.execute(sa.text("ANALYZE tasks"))
+        explain_sql = "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + _KEYED_CANDIDATES_SQL
+        stmt = sa.text(explain_sql).bindparams(
+            sa.bindparam("keys", value=satisfiable_capability_keys(["gpu"]), type_=ARRAY(sa.Text)),
+            sa.bindparam("seen_ids", value=[], type_=ARRAY(PG_UUID(as_uuid=True))),
+            sa.bindparam("need", value=1),
+        )
+        raw = (await conn.execute(stmt)).scalar_one()
+
+    # psycopg3 auto-decodes the `json` column type, so `raw` is already a
+    # list of dicts here, not a JSON string -- no json.loads needed.
+    plan = raw[0]["Plan"]
+
+    def _walk(node: dict):
+        yield node
+        for child in node.get("Plans", []):
+            yield from _walk(child)
+
+    index_names = {n.get("Index Name") for n in _walk(plan) if n.get("Index Name")}
+    assert "idx_tasks_ready_by_capability" in index_names, (
+        f"expected the keyed index to be used; plan used {index_names or 'no index'}"
+    )
+
+    total_buffers = sum(
+        n.get("Shared Hit Blocks", 0) + n.get("Shared Read Blocks", 0) for n in _walk(plan)
+    )
+    # Bounded by the number of satisfiable keys (2: "" and "gpu") times a
+    # small per-branch working set -- nowhere near the 2,000-row queue depth.
+    # This is the number that would grow with queue depth under the OLD
+    # filter approach and does not grow here.
+    assert total_buffers < 50, (
+        f"query touched {total_buffers} buffer pages -- expected a small, "
+        "queue-depth-independent number from the keyed index scan"
+    )
 
 
 async def test_capability_filtering_does_not_starve_under_concurrency(

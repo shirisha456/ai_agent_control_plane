@@ -48,6 +48,7 @@ async def submit_task(
     idempotency_key: str | None = None,
     priority: int = 100,
     max_attempts: int = 3,
+    max_execution_time_s: int = 300,
     available_at: datetime | None = None,
     agent_version_id: UUID | None = None,
     required_capabilities: Sequence[str] = (),
@@ -72,6 +73,7 @@ async def submit_task(
         "idempotency_key": idempotency_key,
         "priority": priority,
         "max_attempts": max_attempts,
+        "max_execution_time_s": max_execution_time_s,
         "state": State.QUEUED.value,
         # PINNED at submit, never re-resolved. A task that sat in the queue
         # for an hour still runs the version that was current when it was

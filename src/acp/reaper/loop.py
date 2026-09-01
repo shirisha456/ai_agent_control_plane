@@ -14,7 +14,7 @@ import contextlib
 import time
 
 from acp.config import Settings
-from acp.db.queries.reap import reap_expired_leases
+from acp.db.queries.reap import reap_expired_leases, reap_hung_tasks
 from acp.db.queries.workers import mark_dead_workers
 from acp.db.session import transaction
 from acp.obs import metrics
@@ -72,6 +72,32 @@ class Reaper:
             metrics.task_recoveries.labels(disposition="failed_exhausted").inc(failed)
         if requeued or failed:
             logger.warning("reaper.leases_reclaimed", requeued=requeued, failed_exhausted=failed)
+
+        # SECOND sweep, same bounded-rounds shape as the lease sweep above but
+        # a DIFFERENT candidate set: RUNNING tasks whose lease is still valid
+        # (still being renewed) but whose wall-clock execution time has
+        # exceeded the cap they were pinned with at submit. Lease expiry
+        # cannot catch this -- a worker stuck in a loop keeps renewing
+        # normally right up until something else notices.
+        hung_requeued = hung_failed = 0
+        for _ in range(self.max_batches_per_sweep):
+            if self._stopping.is_set():
+                break
+            async with transaction() as conn:
+                hung_result = await reap_hung_tasks(conn, limit=self.batch_size)
+            hung_requeued += hung_result.requeued
+            hung_failed += hung_result.failed_exhausted
+            if hung_result.reaped < self.batch_size:
+                break
+
+        if hung_requeued:
+            metrics.hung_tasks_detected.labels(disposition="requeued").inc(hung_requeued)
+        if hung_failed:
+            metrics.hung_tasks_detected.labels(disposition="failed_exhausted").inc(hung_failed)
+        if hung_requeued or hung_failed:
+            logger.warning(
+                "reaper.hung_tasks_reclaimed", requeued=hung_requeued, failed_exhausted=hung_failed
+            )
 
         async with transaction() as conn:
             dead = await mark_dead_workers(conn, dead_after_s=self.settings.worker_dead_after_s)

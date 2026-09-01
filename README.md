@@ -4,7 +4,7 @@ Distributed scheduler and durable execution engine for AI agent workloads — bu
 
 `Python · FastAPI · PostgreSQL · SQLAlchemy Core · Docker · Prometheus · Grafana · OpenTelemetry`
 
-> **Status:** all 11 planned phases implemented. 303 tests passing (unit, integration, concurrency, chaos). Real benchmark numbers in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) — nothing in this document is estimated. See [Recommended Engineering Improvements](#recommended-engineering-improvements) for the gaps left open on purpose.
+> **Status:** all 11 planned phases implemented, plus hung-worker detection and a keyed capability index. 312 tests passing (unit, integration, concurrency, chaos). Real benchmark numbers in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) — nothing in this document is estimated. See [Recommended Engineering Improvements](#recommended-engineering-improvements) for the gaps left open on purpose.
 
 ---
 
@@ -244,9 +244,7 @@ docs/           architecture rationale, benchmarks
 
 Gaps left open deliberately, not hidden:
 
-- **Hung-worker detection is missing.** A worker that keeps renewing its lease but is actually stuck in an infinite loop is never detected — there's no `max_execution_time` ceiling yet. The fix is straightforward (compare `task_attempts.started_at` against a cap in the reaper sweep) but isn't built.
 - **PostgreSQL is a single point of failure.** Accepted for this stage of the project; a real deployment would need a Patroni/HA setup, which is out of scope here.
-- **Capability-aware claiming degrades under a specific load shape.** A specialist worker facing a deep queue of work it can't run scans the whole queue (measured at ~47ms for a 2,000-row queue) because capability matching is a filter, not part of the index key. `tasks.capability_key` already exists, unused, for the keyed-index fix.
 - **No checkpointing.** A retried task reruns from the beginning; there's no mechanism to resume a long-running agent from its last completed step. Scoped out of this project on purpose — it's the highest-effort, lowest-marginal-insight remaining phase.
 - **Tenant concurrency limiting is a soft check**, not a hard atomic counter — under heavy concurrent claiming a tenant can briefly overshoot its `max_concurrent_tasks`. Bounded, but not exact.
 

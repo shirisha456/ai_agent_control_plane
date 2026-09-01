@@ -6,7 +6,7 @@ import pytest
 import sqlalchemy as sa
 
 from acp.db.models import task_attempts, task_events, tasks, workers
-from acp.db.queries.reap import reap_expired_leases
+from acp.db.queries.reap import reap_expired_leases, reap_hung_tasks
 from acp.db.queries.transitions import Rejection, transition
 from acp.db.queries.workers import mark_dead_workers
 from acp.domain.states import EventType, State
@@ -15,6 +15,8 @@ pytestmark = pytest.mark.db
 
 EXPIRED = sa.text("now() - interval '1 second'")
 FUTURE = sa.text("now() + interval '30 seconds'")
+LONG_AGO = sa.text("now() - interval '1 hour'")
+JUST_NOW = sa.text("now()")
 
 
 async def _insert_attempt_row(engine, task_id, attempt, worker_id) -> None:
@@ -169,6 +171,159 @@ async def test_reap_fence_rejects_a_lease_renewed_after_the_candidate_scan(
         )
     assert not res.applied
     assert res.rejection is Rejection.LEASE_NOT_EXPIRED
+
+    async with engine.connect() as conn:
+        state = (
+            await conn.execute(sa.select(tasks.c.state).where(tasks.c.id == task_id))
+        ).scalar_one()
+    assert state == State.RUNNING.value
+
+
+async def test_reap_hung_task_requeues_with_remaining_attempts(
+    engine, make_task, make_worker
+) -> None:
+    """A hung task is caught even though its lease is still perfectly valid.
+
+    That's the whole point of this detector: an infinite loop or a call with
+    no timeout keeps renewing its lease faithfully while being stuck, so
+    lease expiry alone would never catch it.
+    """
+    worker_id = await make_worker()
+    task_id = await make_task(
+        state=State.RUNNING.value,
+        attempt=1,
+        max_attempts=3,
+        lease_worker_id=worker_id,
+        lease_expires_at=FUTURE,
+        first_started_at=LONG_AGO,
+        max_execution_time_s=1,
+    )
+    await _insert_attempt_row(engine, task_id, 1, worker_id)
+
+    async with engine.connect() as conn, conn.begin():
+        reaped = (await reap_hung_tasks(conn, limit=10)).reaped
+    assert reaped == 1
+
+    async with engine.connect() as conn:
+        row = (await conn.execute(sa.select(tasks).where(tasks.c.id == task_id))).mappings().one()
+    assert row["state"] == State.QUEUED.value
+    assert row["lease_worker_id"] is None
+    assert row["lease_expires_at"] is None
+    assert row["error_class"] == "ExecutionTimeExceeded"
+
+    async with engine.connect() as conn:
+        attempt_row = (
+            (
+                await conn.execute(
+                    sa.select(task_attempts.c.outcome).where(
+                        task_attempts.c.task_id == task_id, task_attempts.c.attempt == 1
+                    )
+                )
+            )
+            .mappings()
+            .one()
+        )
+        events = (
+            (
+                await conn.execute(
+                    sa.select(task_events.c.event_type)
+                    .where(task_events.c.task_id == task_id)
+                    .order_by(task_events.c.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert attempt_row["outcome"] == "LOST"
+    assert events == [EventType.TASK_RECOVERED.value, EventType.WORKER_LOST.value]
+
+
+async def test_reap_hung_task_fails_when_attempts_exhausted(engine, make_task, make_worker) -> None:
+    worker_id = await make_worker()
+    task_id = await make_task(
+        state=State.RUNNING.value,
+        attempt=3,
+        max_attempts=3,
+        lease_worker_id=worker_id,
+        lease_expires_at=FUTURE,
+        first_started_at=LONG_AGO,
+        max_execution_time_s=1,
+    )
+    await _insert_attempt_row(engine, task_id, 3, worker_id)
+
+    async with engine.connect() as conn, conn.begin():
+        reaped = (await reap_hung_tasks(conn, limit=10)).reaped
+    assert reaped == 1
+
+    async with engine.connect() as conn:
+        row = (
+            (
+                await conn.execute(
+                    sa.select(tasks.c.state, tasks.c.finished_at).where(tasks.c.id == task_id)
+                )
+            )
+            .mappings()
+            .one()
+        )
+    assert row["state"] == State.FAILED.value
+    assert row["finished_at"] is not None
+
+
+async def test_reap_hung_tasks_ignores_tasks_still_within_their_cap(
+    engine, make_task, make_worker
+) -> None:
+    worker_id = await make_worker()
+    task_id = await make_task(
+        state=State.RUNNING.value,
+        attempt=1,
+        lease_worker_id=worker_id,
+        lease_expires_at=FUTURE,
+        first_started_at=JUST_NOW,
+        max_execution_time_s=300,
+    )
+
+    async with engine.connect() as conn, conn.begin():
+        reaped = (await reap_hung_tasks(conn, limit=10)).reaped
+    assert reaped == 0
+
+    async with engine.connect() as conn:
+        state = (
+            await conn.execute(sa.select(tasks.c.state).where(tasks.c.id == task_id))
+        ).scalar_one()
+    assert state == State.RUNNING.value
+
+
+async def test_transition_rejects_execution_time_exceeded_when_not_exceeded(
+    engine, make_task, make_worker
+) -> None:
+    """The fencing predicate itself, not just the candidate scan, must enforce this.
+
+    Mirrors test_reap_fence_rejects_a_lease_renewed_after_the_candidate_scan:
+    the guard has to reject a task that has not actually exceeded its budget,
+    independent of whatever query found it as a "candidate".
+    """
+    worker_id = await make_worker()
+    task_id = await make_task(
+        state=State.RUNNING.value,
+        attempt=1,
+        lease_worker_id=worker_id,
+        lease_expires_at=FUTURE,
+        first_started_at=JUST_NOW,
+        max_execution_time_s=300,
+    )
+
+    async with engine.connect() as conn, conn.begin():
+        res = await transition(
+            conn,
+            task_id,
+            expect_state=State.RUNNING,
+            to_state=State.QUEUED,
+            event_type=EventType.TASK_RECOVERED,
+            expect_execution_time_exceeded=True,
+            set_fields={"lease_worker_id": None, "lease_expires_at": None},
+        )
+    assert not res.applied
+    assert res.rejection is Rejection.EXECUTION_TIME_NOT_EXCEEDED
 
     async with engine.connect() as conn:
         state = (

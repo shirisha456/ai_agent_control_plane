@@ -86,6 +86,11 @@ tasks = sa.Table(
     # write must present it. See docs/adr/0003.
     sa.Column("attempt", sa.Integer, nullable=False, server_default="0"),
     sa.Column("max_attempts", sa.Integer, nullable=False, server_default="3"),
+    # Pinned at submit (from the resolved agent version, or a default for a
+    # direct submission) exactly like max_attempts -- so the reaper's
+    # hung-task check reads one row, no join against the registry, matching
+    # every other pinned-at-submit field on this table.
+    sa.Column("max_execution_time_s", sa.Integer, nullable=False, server_default="300"),
     # One column serves both delayed submission and retry backoff. A separate
     # next_retry_at would be a second way to say the same thing, and the two
     # would eventually drift.
@@ -121,6 +126,7 @@ tasks = sa.Table(
     sa.Column("first_started_at", TS),
     sa.Column("finished_at", TS),
     sa.CheckConstraint("max_attempts >= 1", name="ck_tasks_max_attempts"),
+    sa.CheckConstraint("max_execution_time_s >= 1", name="ck_tasks_max_execution_time"),
     sa.CheckConstraint("attempt >= 0", name="ck_tasks_attempt_nonneg"),
     sa.CheckConstraint("priority >= 0", name="ck_tasks_priority_nonneg"),
     # "A RUNNING task always has an owner and a deadline" is an invariant, so

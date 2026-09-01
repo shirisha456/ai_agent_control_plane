@@ -38,6 +38,34 @@ correctly either way: every candidate in one batch would see the SAME
 pre-batch RUNNING count, so a tenant at 0/1 with two eligible tasks in the
 batch would have BOTH pass the check. Slack has to be consumed as it is
 spent, not read once per row.
+
+CAPABILITY MATCHING: A KEYED MERGE, NOT A FILTER
+-------------------------------------------------
+Candidate selection used to be a single ordered scan of idx_tasks_ready with
+`required_capabilities <@ ARRAY[worker_capabilities]` applied as a FILTER
+after the fact. That degrades badly under one specific, measured load shape:
+a specialist worker facing a deep queue of work it cannot run has to walk
+past nearly the whole queue in priority order rejecting almost everything --
+O(queue depth) instead of O(batch). Measured at ~47ms for a 2,000-row queue
+in the version of this file that shipped with only the filter.
+
+The fix uses `domain.agents.satisfiable_capability_keys`: the set of
+`capability_key` values a worker with a given capability list can EVER
+satisfy is exactly the canonical encoding of every SUBSET of its own
+capabilities -- a pure function of the worker, needing no query. Candidate
+selection then becomes a K-way merge: one Postgres LATERAL branch per
+satisfiable key, each an independently ordered, locked, LIMIT-bounded index
+range scan against idx_tasks_ready_by_capability (capability_key, priority,
+available_at, id), unioned and re-sorted in Python over at most K * `need`
+rows -- bounded by the worker's OWN capability count, never by queue depth.
+A generalist worker (no declared capabilities) has exactly one satisfiable
+key (`""`), so this reduces to a single ordered range scan identical in shape
+to the old idx_tasks_ready scan for the common case.
+
+Bounded by MAX_KEYED_CLAIM_CAPABILITIES: a worker declaring more distinct
+capabilities than that falls back to the plain containment-filter query
+instead of generating an impractically large number of LATERAL branches --
+see domain.agents' docstring for why that bound is generous in practice.
 """
 
 from __future__ import annotations
@@ -48,17 +76,90 @@ from uuid import UUID
 
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import ARRAY
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from acp.db.models import task_attempts, task_events, tasks, tenants
 from acp.db.sqlutil import seconds
+from acp.domain.agents import MAX_KEYED_CLAIM_CAPABILITIES, satisfiable_capability_keys
 from acp.domain.states import EventType, State
 from acp.scheduling.policy import ClaimPolicy
+
+#: One Postgres LATERAL branch per key, one ordered+locked+limited range scan
+#: per branch, merged and re-sorted in Python. Written as raw SQL rather than
+#: assembled from Core: the shape (UNNEST driving a LATERAL join, FOR UPDATE
+#: SKIP LOCKED inside the lateral subquery) is exactly the kind of
+#: correctness-critical, Postgres-specific construct this project keeps as
+#: literal SQL so a reviewer can read precisely what runs, rather than trust
+#: a query-builder's rendering of it.
+_KEYED_CANDIDATES_SQL = """
+    SELECT t.id, t.tenant_id, t.priority, t.available_at
+      FROM unnest(CAST(:keys AS text[])) AS k(capability_key)
+      CROSS JOIN LATERAL (
+          SELECT id, tenant_id, priority, available_at
+            FROM tasks
+           WHERE state = 'QUEUED'
+             AND available_at <= now()
+             AND capability_key = k.capability_key
+             AND NOT (id = ANY(CAST(:seen_ids AS uuid[])))
+           ORDER BY priority ASC, available_at ASC, id ASC
+           LIMIT :need
+             FOR UPDATE SKIP LOCKED
+      ) t
+"""
 
 #: How many consecutive tenant-blocked rounds one claim call absorbs before
 #: giving up and leaving the rest for the next poll cycle. Not a correctness
 #: requirement -- worst case it just costs another poll cycle.
 MAX_ROUNDS = 4
+
+
+async def _fetch_candidates(
+    conn: AsyncConnection,
+    *,
+    worker_capabilities: Sequence[str],
+    order_sql: str,
+    need: int,
+    seen_ids: set[UUID],
+) -> list[Any]:
+    """One round's worth of lockable candidates, in priority order.
+
+    Two strategies, chosen by how many distinct capabilities the worker
+    declares -- see the module docstring for why each is right in its regime.
+    """
+    normalised_caps = sorted({c.strip().lower() for c in worker_capabilities if c and c.strip()})
+
+    if len(normalised_caps) <= MAX_KEYED_CLAIM_CAPABILITIES:
+        keys = satisfiable_capability_keys(normalised_caps)
+        stmt = sa.text(_KEYED_CANDIDATES_SQL).bindparams(
+            sa.bindparam("keys", value=keys, type_=ARRAY(sa.Text)),
+            sa.bindparam("seen_ids", value=list(seen_ids), type_=ARRAY(PG_UUID(as_uuid=True))),
+            sa.bindparam("need", value=need),
+        )
+        rows = (await conn.execute(stmt)).all()
+        # The merge is unordered ACROSS keys (each branch is independently
+        # ordered, but Postgres does not guarantee an order across UNNEST
+        # iterations) -- bounded by (number of satisfiable keys) * need, never
+        # by queue depth, so sorting it here is cheap regardless of how deep
+        # the underlying queue is.
+        rows.sort(key=lambda r: (r.priority, r.available_at, r.id))
+        return rows[:need]
+
+    # Fallback for a worker declaring an unusually large capability set: the
+    # plain containment filter, correct for any input, just not keyed-index
+    # friendly. See MAX_KEYED_CLAIM_CAPABILITIES's docstring for why this path
+    # is expected to be rare in practice.
+    stmt = sa.select(tasks.c.id, tasks.c.tenant_id, tasks.c.priority, tasks.c.available_at).where(
+        tasks.c.state == State.QUEUED.value,
+        tasks.c.available_at <= sa.func.now(),
+        tasks.c.required_capabilities.contained_by(
+            sa.cast(sa.literal(list(worker_capabilities)), ARRAY(sa.Text))
+        ),
+    )
+    if seen_ids:
+        stmt = stmt.where(tasks.c.id.notin_(seen_ids))
+    stmt = stmt.order_by(sa.text(order_sql)).limit(need).with_for_update(skip_locked=True)
+    return (await conn.execute(stmt)).all()
 
 
 async def claim_tasks(
@@ -87,41 +188,13 @@ async def claim_tasks(
         if need <= 0:
             break
 
-        stmt = sa.select(tasks.c.id, tasks.c.tenant_id).where(
-            tasks.c.state == State.QUEUED.value,
-            tasks.c.available_at <= sa.func.now(),
-            # CAPABILITY MATCHING: the task's requirements must be a SUBSET of
-            # what this worker offers (PostgreSQL's `<@` array containment).
-            #
-            # An empty requirement set is contained by everything, so a task
-            # that states no requirements is claimable by any worker -- the
-            # right default, because a task with no stated needs should never
-            # be unschedulable.
-            #
-            # required_capabilities was COPIED onto the task at submit from an
-            # immutable agent version (migration 0006), so this predicate needs
-            # no join against the registry. That is the whole reason pinning is
-            # a performance decision and not only a reproducibility one.
-            #
-            # PLAN NOTE: this is a FILTER applied to rows the ready index
-            # returns in priority order, not part of the index key. It is right
-            # when most tasks are claimable by most workers, which is the
-            # normal case. It degrades when a specialist worker faces a deep
-            # queue of work it cannot run: the scan walks the whole queue in
-            # priority order rejecting nearly everything, so claim latency
-            # becomes O(queue depth) instead of O(batch).
-            # tests/integration/test_capability_scheduling.py measures exactly
-            # that case; `tasks.capability_key` exists (unused today) so the
-            # fix is a keyed partial index rather than another rewrite of a
-            # hot table.
-            tasks.c.required_capabilities.contained_by(
-                sa.cast(sa.literal(list(worker_capabilities)), ARRAY(sa.Text))
-            ),
+        batch = await _fetch_candidates(
+            conn,
+            worker_capabilities=worker_capabilities,
+            order_sql=order_sql,
+            need=need,
+            seen_ids=seen_ids,
         )
-        if seen_ids:
-            stmt = stmt.where(tasks.c.id.notin_(seen_ids))
-        stmt = stmt.order_by(sa.text(order_sql)).limit(need).with_for_update(skip_locked=True)
-        batch = (await conn.execute(stmt)).all()
         if not batch:
             break
         seen_ids.update(row.id for row in batch)

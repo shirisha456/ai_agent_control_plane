@@ -68,6 +68,13 @@ class TaskCreate(BaseModel):
 
     max_attempts: int = Field(default=3, ge=1, le=20)
 
+    # Hung-worker cap: the reaper force-fails (or retries) a RUNNING task
+    # whose attempt has run longer than this, independent of lease
+    # validity -- a worker that keeps renewing but is actually stuck
+    # (an infinite loop, a hung call with no timeout) never trips lease
+    # expiry, since its lease stays valid forever.
+    max_execution_time_s: int = Field(default=300, ge=1, le=86_400)
+
     # Delayed submission. Shares the `available_at` column with retry backoff,
     # because "not runnable until T" is one concept, not two.
     available_at: datetime | None = None
@@ -104,6 +111,7 @@ class TaskOut(BaseModel):
     state: str
     attempt: int
     max_attempts: int
+    max_execution_time_s: int
     available_at: datetime
     lease_worker_id: str | None
     lease_expires_at: datetime | None

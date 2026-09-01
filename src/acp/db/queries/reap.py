@@ -1,4 +1,4 @@
-"""Reclaim RUNNING tasks whose lease expired because their worker went dark.
+"""Reclaim RUNNING tasks the normal path cannot: expired leases, and hung workers.
 
 Phase 2 shipped with no failure detection at all: a crashed or paused worker
 left its tasks RUNNING forever. This is the fix. It is the ONLY code path,
@@ -12,6 +12,16 @@ fencing token is allocated at CLAIM time, not at recovery time, so a stale
 completion from the presumed-dead worker is rejected by the state check alone
 (RUNNING -> QUEUED already moved the row out from under it) without needing a
 second guard.
+
+HUNG TASKS ARE A DIFFERENT FAILURE FROM AN EXPIRED LEASE
+---------------------------------------------------------
+Lease expiry catches a worker that stopped answering. It cannot catch a
+worker that is still faithfully renewing its lease every few seconds but is
+actually stuck -- an infinite loop, a call with no timeout -- because the
+lease itself is perfectly valid the whole time. That failure is caught here
+too, fenced on `expect_execution_time_exceeded` instead: wall-clock time since
+the attempt started, compared against that task's own pinned
+`max_execution_time_s`, independent of lease validity.
 """
 
 from __future__ import annotations
@@ -27,6 +37,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from acp.db.models import tasks
 from acp.db.queries.completion import finish_attempt
 from acp.db.queries.transitions import record_event, transition
+from acp.db.sqlutil import seconds
 from acp.domain.states import EventType, State
 
 
@@ -175,6 +186,139 @@ async def reap_expired_leases(conn: AsyncConnection, *, limit: int) -> ReapResul
     for row in candidates:
         exhausted = row["attempt"] >= row["max_attempts"]
         if await reap_task(
+            conn,
+            row["id"],
+            attempt=row["attempt"],
+            max_attempts=row["max_attempts"],
+            lease_worker_id=row["lease_worker_id"],
+        ):
+            if exhausted:
+                result.failed_exhausted += 1
+            else:
+                result.requeued += 1
+            result.overdue_s.append(float(row["overdue_s"]))
+    return result
+
+
+async def find_hung_tasks(conn: AsyncConnection, *, limit: int) -> list[Mapping[str, Any]]:
+    """Lock a batch of RUNNING tasks that have exceeded their own execution-time cap.
+
+    Deliberately NOT restricted to leases that are also expired -- a hung
+    worker's lease is, by definition, still valid (it is still renewing). The
+    only signal available is wall-clock time since the attempt started versus
+    the cap the task was pinned with at submit.
+
+    No dedicated index: the candidate set is already `state = 'RUNNING'`,
+    which is inherently small (bounded by total fleet concurrency, not queue
+    depth), so a plain scan filtered to that partial condition costs little --
+    the same reasoning that lets find_expired_leases's index also serve as an
+    adequate access path here if the planner chooses it.
+    """
+    stmt = (
+        sa.select(
+            tasks.c.id,
+            tasks.c.attempt,
+            tasks.c.max_attempts,
+            tasks.c.lease_worker_id,
+            sa.extract(
+                "epoch",
+                sa.func.now() - tasks.c.first_started_at - seconds(tasks.c.max_execution_time_s),
+            ).label("overdue_s"),
+        )
+        .where(
+            tasks.c.state == State.RUNNING.value,
+            tasks.c.first_started_at.is_not(None),
+            tasks.c.first_started_at + seconds(tasks.c.max_execution_time_s) < sa.func.now(),
+        )
+        .order_by(tasks.c.first_started_at)
+        .limit(limit)
+        .with_for_update(skip_locked=True)
+    )
+    return (await conn.execute(stmt)).mappings().all()
+
+
+async def reap_hung_task(
+    conn: AsyncConnection,
+    task_id: UUID,
+    *,
+    attempt: int,
+    max_attempts: int,
+    lease_worker_id: str | None,
+) -> bool:
+    """Force-end one hung attempt: back to QUEUED, or FAILED if attempts are exhausted.
+
+    Structurally identical to `reap_task` -- same two-way branch on the
+    attempt budget, same "attempt is not bumped here" rule -- fenced on
+    `expect_execution_time_exceeded` instead of `expect_lease_expired`. A
+    `False` return means the attempt legitimately completed (or the lease
+    already separately expired and was reclaimed) between the candidate scan
+    and this write -- routine, not an error.
+    """
+    error_message = f"execution time exceeded; worker {lease_worker_id!r} presumed stuck"
+    if attempt < max_attempts:
+        res = await transition(
+            conn,
+            task_id,
+            expect_state=State.RUNNING,
+            to_state=State.QUEUED,
+            event_type=EventType.TASK_RECOVERED,
+            expect_execution_time_exceeded=True,
+            set_fields={
+                "available_at": sa.func.now(),
+                "lease_worker_id": None,
+                "lease_expires_at": None,
+                "error_class": "ExecutionTimeExceeded",
+                "error_message": error_message,
+            },
+            event_data={"lease_worker_id": lease_worker_id},
+        )
+    else:
+        res = await transition(
+            conn,
+            task_id,
+            expect_state=State.RUNNING,
+            to_state=State.FAILED,
+            event_type=EventType.TASK_FAILED,
+            expect_execution_time_exceeded=True,
+            set_fields={
+                "finished_at": sa.func.now(),
+                "lease_worker_id": None,
+                "lease_expires_at": None,
+                "error_class": "ExecutionTimeExceeded",
+                "error_message": error_message,
+            },
+            event_data={"lease_worker_id": lease_worker_id, "reason": "attempts_exhausted"},
+        )
+
+    if not res.applied:
+        return False
+
+    await record_event(
+        conn,
+        task_id,
+        EventType.WORKER_LOST,
+        attempt=attempt,
+        worker_id=lease_worker_id,
+        data={"reason": "execution_time_exceeded"},
+    )
+    await finish_attempt(
+        conn,
+        task_id,
+        attempt,
+        outcome="LOST",
+        error_class="ExecutionTimeExceeded",
+        error_message=error_message,
+    )
+    return True
+
+
+async def reap_hung_tasks(conn: AsyncConnection, *, limit: int) -> ReapResult:
+    """Find and force-end up to `limit` tasks stuck past their execution-time cap."""
+    candidates = await find_hung_tasks(conn, limit=limit)
+    result = ReapResult()
+    for row in candidates:
+        exhausted = row["attempt"] >= row["max_attempts"]
+        if await reap_hung_task(
             conn,
             row["id"],
             attempt=row["attempt"],

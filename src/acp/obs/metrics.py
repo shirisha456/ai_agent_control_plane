@@ -147,6 +147,18 @@ task_recoveries = Counter(
     registry=REGISTRY,
 )
 
+hung_tasks_detected = Counter(
+    "acp_hung_tasks_detected_total",
+    (
+        "Tasks force-ended for exceeding their execution-time cap while their "
+        "lease was still valid -- a worker stuck in a loop or a hung call, "
+        "which lease expiry alone cannot catch because a stuck worker keeps "
+        "renewing normally."
+    ),
+    ["disposition"],  # requeued | failed_exhausted -- same vocabulary as task_recoveries
+    registry=REGISTRY,
+)
+
 workers_marked_dead = Counter(
     "acp_workers_marked_dead_total",
     "Workers whose heartbeat went stale.",

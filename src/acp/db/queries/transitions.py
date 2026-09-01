@@ -39,6 +39,7 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from acp.db.models import task_events, tasks
+from acp.db.sqlutil import seconds
 from acp.domain.states import EventType, State, assert_legal
 
 
@@ -56,6 +57,7 @@ class Rejection(StrEnum):
     ATTEMPT_MISMATCH = "attempt_mismatch"
     WORKER_MISMATCH = "worker_mismatch"
     LEASE_NOT_EXPIRED = "lease_not_expired"
+    EXECUTION_TIME_NOT_EXCEEDED = "execution_time_not_exceeded"
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +81,7 @@ async def transition(
     expect_attempt: int | None = None,
     expect_worker: str | None = None,
     expect_lease_expired: bool = False,
+    expect_execution_time_exceeded: bool = False,
     set_fields: Mapping[str, Any] | None = None,
     event_data: Mapping[str, Any] | None = None,
 ) -> TransitionResult:
@@ -101,6 +104,18 @@ async def transition(
     renews between the reaper's candidate SELECT and this UPDATE, the
     predicate now fails and the reaper's write is discarded, exactly like any
     other lost CAS race.
+
+    `expect_execution_time_exceeded=True` is the SAME idea for a different
+    failure: a worker that is still faithfully renewing its lease but is
+    actually stuck (an infinite loop, a hung network call with no timeout)
+    never trips `expect_lease_expired` -- its lease stays valid forever. This
+    fences on wall-clock elapsed time since the attempt started
+    (`first_started_at`) against that task's own `max_execution_time_s`,
+    regardless of lease validity. Like the lease-expiry fence, the comparison
+    against `now()` happens IN the UPDATE, so a task that legitimately
+    finishes between the reaper's candidate scan and this write loses the
+    race cleanly instead of being force-failed out from under a worker that
+    was about to complete it.
     """
     expected: tuple[State, ...] = (
         (expect_state,) if isinstance(expect_state, State) else tuple(expect_state)
@@ -124,12 +139,23 @@ async def transition(
         stmt = stmt.where(tasks.c.lease_worker_id == expect_worker)
     if expect_lease_expired:
         stmt = stmt.where(tasks.c.lease_expires_at < sa.func.now())
+    if expect_execution_time_exceeded:
+        stmt = stmt.where(
+            tasks.c.first_started_at.is_not(None),
+            tasks.c.first_started_at + seconds(tasks.c.max_execution_time_s) < sa.func.now(),
+        )
 
     row = (await conn.execute(stmt.values(**values).returning(*tasks.c))).mappings().first()
 
     if row is None:
         return await _explain(
-            conn, task_id, expected, expect_attempt, expect_worker, expect_lease_expired
+            conn,
+            task_id,
+            expected,
+            expect_attempt,
+            expect_worker,
+            expect_lease_expired,
+            expect_execution_time_exceeded,
         )
 
     await conn.execute(
@@ -151,6 +177,7 @@ async def _explain(
     expect_attempt: int | None,
     expect_worker: str | None,
     expect_lease_expired: bool,
+    expect_execution_time_exceeded: bool = False,
 ) -> TransitionResult:
     """Re-read the row to classify the rejection.
 
@@ -167,6 +194,15 @@ async def _explain(
                     tasks.c.lease_worker_id,
                     tasks.c.lease_expires_at,
                     (tasks.c.lease_expires_at < sa.func.now()).label("lease_expired"),
+                    tasks.c.first_started_at,
+                    tasks.c.max_execution_time_s,
+                    (
+                        tasks.c.first_started_at.is_not(None)
+                        & (
+                            tasks.c.first_started_at + seconds(tasks.c.max_execution_time_s)
+                            < sa.func.now()
+                        )
+                    ).label("execution_time_exceeded"),
                 ).where(tasks.c.id == task_id)
             )
         )
@@ -185,11 +221,14 @@ async def _explain(
         reason = Rejection.WORKER_MISMATCH
     elif expect_lease_expired and not obs["lease_expired"]:
         reason = Rejection.LEASE_NOT_EXPIRED
+    elif expect_execution_time_exceeded and not obs["execution_time_exceeded"]:
+        reason = Rejection.EXECUTION_TIME_NOT_EXCEEDED
     else:
         # The row matched on re-read but not during the UPDATE: another
         # transaction committed in between. Treat as contention.
         reason = Rejection.STATE_MISMATCH
     del obs["lease_expired"]
+    del obs["execution_time_exceeded"]
     return TransitionResult(applied=False, rejection=reason, observed=obs)
 
 

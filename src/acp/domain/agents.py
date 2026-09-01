@@ -34,6 +34,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from enum import StrEnum
+from itertools import combinations
 
 
 class AgentStatus(StrEnum):
@@ -104,3 +105,46 @@ def worker_satisfies(required: Iterable[str], worker_capabilities: Iterable[str]
     have = {c.strip().lower() for c in worker_capabilities if c and c.strip()}
     need = {c.strip().lower() for c in required if c and c.strip()}
     return need.issubset(have)
+
+
+#: A worker declaring more distinct capabilities than this falls back to the
+#: plain containment-filter claim path instead of the keyed one. 2**5 = 32
+#: subset keys -- and therefore at most 32 LATERAL branches per claim query --
+#: is already far more than any realistic deployment needs (a worker's
+#: capabilities are a handful of hardware/environment flags -- gpu, internet,
+#: large_context -- not an open-ended tag set). Kept tight deliberately: the
+#: keyed path's whole value proposition is a query bounded by the worker's
+#: OWN capability count, and a generous cap here would let a misconfigured
+#: worker (or a future feature nobody bounded) quietly regenerate the exact
+#: unbounded-scan problem this fix exists to solve, just shaped as "many
+#: branches" instead of "one filtered scan".
+MAX_KEYED_CLAIM_CAPABILITIES = 5
+
+
+def satisfiable_capability_keys(worker_capabilities: Iterable[str]) -> list[str]:
+    """Every `capability_key` value a worker with these capabilities can claim.
+
+    A worker satisfies a task's required-capability set iff that set is a
+    SUBSET of the worker's own capabilities (see `worker_satisfies`). Since
+    `capability_key` is a canonical encoding of a required-capability set, the
+    keys a worker can EVER claim are exactly the canonical encodings of every
+    subset of its own capability list -- a pure function of the worker's own
+    capabilities, needing no query against `tasks` to compute.
+
+    This is what makes the claim query's capability filter replaceable with
+    an index lookup (see db/queries/claim.py): rather than scanning the
+    priority-ordered queue and rejecting rows whose requirements aren't a
+    subset, the claim can instead ask the database directly for rows whose
+    `capability_key` is one of these -- values, each servable by an
+    ordered index range scan instead of a filtered walk of the whole queue.
+
+    A generalist worker (no declared capabilities) has exactly one satisfiable
+    key: `""`, matching a task with no stated requirements -- identical to the
+    subset check `[] <= []`, just expressed as an index-friendly value.
+    """
+    caps = sorted({c.strip().lower() for c in worker_capabilities if c and c.strip()})
+    keys: set[str] = set()
+    for r in range(len(caps) + 1):
+        for combo in combinations(caps, r):
+            keys.add(capability_key(combo))
+    return sorted(keys)

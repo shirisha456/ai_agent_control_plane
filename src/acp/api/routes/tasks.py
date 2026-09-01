@@ -106,6 +106,7 @@ async def _submit(body: TaskCreate, response: Response, conn: Txn) -> TaskOut:
     resolution = None
     task_type = body.task_type
     max_attempts = body.max_attempts
+    max_execution_time_s = body.max_execution_time_s
     if body.request_type is not None:
         try:
             resolution = await aq.resolve_route(
@@ -120,6 +121,7 @@ async def _submit(body: TaskCreate, response: Response, conn: Txn) -> TaskOut:
         # travels with the immutable definition, so rolling a version back
         # rolls its limits back too.
         max_attempts = resolution.max_attempts
+        max_execution_time_s = resolution.max_execution_time_s
 
     # A plain (trace_id, span_id) pair, not a parent context: the executing
     # span will be created as a LINK, not a child, because this submission's
@@ -139,6 +141,7 @@ async def _submit(body: TaskCreate, response: Response, conn: Txn) -> TaskOut:
             idempotency_key=body.idempotency_key,
             priority=body.priority,
             max_attempts=max_attempts,
+            max_execution_time_s=max_execution_time_s,
             available_at=body.available_at,
             agent_version_id=resolution.version_id if resolution else None,
             required_capabilities=resolution.required_capabilities if resolution else (),
